@@ -1,0 +1,24 @@
+# Output Directory
+
+This directory stores processing results.
+
+## Structure
+
+Each demo scenario or run creates a subdirectory:
+
+```
+output/
+├── update/                 # Scenario: 明确更新
+│   ├── processing_results.json
+│   ├── ledger_snapshot.json
+│   └── run_report.json
+├── ambiguous/              # Scenario: 同名费用歧义
+├── create/                 # Scenario: 新增费用
+└── conditional/            # Scenario: 条件收费
+```
+
+## File Descriptions
+
+- **processing_results.json**: Individual charge processing results with decision details
+- **ledger_snapshot.json**: Complete ledger snapshot after applying changes
+- **run_report.json**: Execution report with statistics and errors
