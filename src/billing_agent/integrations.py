@@ -8,6 +8,9 @@ import os
 import requests
 import oss2
 from pathlib import Path
+from .logger_config import get_ocr_logger, log_dict
+
+logger = get_ocr_logger()
 
 
 class OCRAdapter:
@@ -19,9 +22,16 @@ class OCRAdapter:
         self.timeout_connect = int(os.getenv("OCR_CONNECT_TIMEOUT", "10"))
         self.timeout_read = int(os.getenv("OCR_TIMEOUT", "300"))
 
+        logger.info(f"OCR Adapter initialized")
+        logger.debug(f"  URL: {self.url}")
+        logger.debug(f"  Token configured: {bool(self.token)}")
+        logger.debug(f"  Timeout: {self.timeout_read}s")
+
     def is_configured(self) -> bool:
         """检查OCR是否已配置"""
-        return bool(self.url)
+        configured = bool(self.url)
+        logger.debug(f"OCR configured: {configured}")
+        return configured
 
     def process_file(
         self,
@@ -42,7 +52,12 @@ class OCRAdapter:
         Returns:
             OCR结果字典
         """
+        logger.info(f"🔍 Starting OCR processing")
+        logger.info(f"  File: {file_url}")
+        logger.info(f"  Task: {task}")
+
         if not self.url:
+            logger.error("❌ OCR_URL not configured")
             raise ValueError("OCR_URL未配置，无法调用OCR服务")
 
         data = {
@@ -52,6 +67,9 @@ class OCRAdapter:
             "taskType": task_type
         }
 
+        logger.debug("📤 Sending OCR request...")
+        log_dict(logger, data, "Request data", level=10)  # DEBUG level
+
         try:
             response = requests.post(
                 self.url,
@@ -59,14 +77,32 @@ class OCRAdapter:
                 timeout=(self.timeout_connect, self.timeout_read)
             )
             response.raise_for_status()
+
+            logger.info(f"✅ OCR request successful (status: {response.status_code})")
+
             ocr_result = response.json()
+            logger.info(f"📄 OCR result received")
+
+            # 记录结果摘要
+            if isinstance(ocr_result, dict):
+                if 'data' in ocr_result:
+                    logger.info(f"  Data keys: {list(ocr_result.get('data', {}).keys())}")
+                if 'text' in ocr_result:
+                    text_preview = str(ocr_result['text'])[:200]
+                    logger.info(f"  Text preview: {text_preview}...")
+
+            log_dict(logger, ocr_result, "Full OCR result", level=10)  # DEBUG level
+
             return ocr_result
 
         except requests.exceptions.Timeout:
+            logger.error(f"❌ OCR request timeout (connect:{self.timeout_connect}s, read:{self.timeout_read}s)")
             raise RuntimeError(f"OCR请求超时（连接:{self.timeout_connect}s, 读取:{self.timeout_read}s）")
         except requests.exceptions.RequestException as e:
+            logger.error(f"❌ OCR request failed: {str(e)}")
             raise RuntimeError(f"OCR请求失败: {str(e)}")
         except ValueError as e:
+            logger.error(f"❌ OCR response parse error: {str(e)}")
             raise RuntimeError(f"OCR返回数据解析失败: {str(e)}")
 
     def process_image(self, image_url: str) -> dict:

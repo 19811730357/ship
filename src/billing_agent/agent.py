@@ -26,81 +26,76 @@ from .models import (
 # Agent提示词模板
 # ============================================
 
-AGENT_SYSTEM_PROMPT = """你是航运账单智能助手。你的任务是分析材料并给出操作建议。
+AGENT_SYSTEM_PROMPT = """你是航运账单智能助手。你的任务是分析材料并提取账单信息。
 
-**任务说明**：
-分析提供的材料内容和旧账记录，为每个费用给出操作建议（CREATE/UPDATE/NO_CHANGE）。
+**重要业务规则**：
+1. **识别账单类型**：
+   - 如果材料是账单（Invoice/Debit Note），应提取总金额（TOTAL/GRAND TOTAL）
+   - 明细项（line items）仅作为参考，不单独记录
+   - 一张账单 = 一条记录
 
-**操作类型判断**：
-- CREATE: 这是新的实际费用，旧账中没有对应记录
-- UPDATE: 原文明确要修改某个费用，且能唯一匹配到旧账记录
-- NO_CHANGE: 这个费用已存在于旧账，且没有变化
+2. **提取原则**：
+   - 优先查找：TOTAL、GRAND TOTAL、BALANCE DUE、AMOUNT DUE 等总金额字段
+   - 明细项存储在 line_items 数组中，用于审计和核对
+   - 如果找不到总金额，则计算所有明细项之和
 
-**重要规则**：
-1. 条件收费条款（"如果...则收取"、"若超期..."）不是实际费用，应该排除到excluded_items
-2. 同名费用有多条旧账时，必须有额外标识（如原金额、单据号）才能唯一匹配
-3. UPDATE操作必须明确指出matched_record_id
-4. 给出清晰的operation_reasoning，说明你的判断依据
-5. 对于不确定的情况，设置confidence为MEDIUM或LOW
+3. **条件收费条款**：
+   - "如果...则收取"、"若超期..."等条件性描述排除
+   - 仅提取实际已发生的费用
 
 **当前记账主体**：{accounting_entity}
 
-**输出格式要求**：
-必须返回JSON对象，包含以下字段：
+**输出格式**：返回JSON对象，包含decisions数组和excluded_items数组。
+
+**示例**：
+材料中有：
+```
+HANDLING CHARGE        65.00
+ADD'L DETENTION     1,310.40
+HANDLING CHARGE        45.00
+------------------------
+TOTAL               1,420.40 USD
+```
+
+应该输出：
 {{
-  "decisions": [
-    {{
-      "suggested_operation": "CREATE|UPDATE|NO_CHANGE",
-      "operation_reasoning": "决策理由",
-      "matched_record_id": "旧账ID（UPDATE时必填）",
-      "confidence": "HIGH|MEDIUM|LOW",
-      "charge_details": {{
-        "original_name": "费用名称",
-        "standardized_name": "标准名称",
-        "amount": 金额数字,
-        "currency": "币种代码",
-        "payment_method": "付款方式"
-      }},
-      "document_info": {{
-        "document_type": "单据类型",
-        "document_number": "单据号",
-        "bill_of_lading": "提单号"
-      }},
-      "transaction_party": {{
-        "issuer": "签发方",
-        "recipient": "接收方"
-      }},
-      "financial_attributes": {{
-        "posting_type": "AR|AP",
-        "posting_type_reasoning": "判断依据"
-      }},
-      "evidence": [
-        {{
-          "source_file": "文件名",
-          "source_type": "email_body|attachment",
-          "original_text": "原文引用"
-        }}
-      ],
-      "field_changes": {{}}
-    }}
-  ],
-  "excluded_items": [
-    {{
-      "item_type": "conditional_charge|summary_line|other",
-      "description": "描述",
-      "reasoning": "排除原因",
-      "amount": 金额或null,
-      "currency": "币种或null"
-    }}
-  ],
-  "document_summary": "整体文档摘要（可选）"
+  "decisions": [{{
+    "charge_details": {{
+      "original_name": "DEBIT NOTE",
+      "amount": 1420.40,
+      "currency": "USD",
+      "line_items": [
+        {{"description": "HANDLING CHARGE", "amount": 65.00, "currency": "USD"}},
+        {{"description": "ADD'L DETENTION FREE TIME CHARGE", "amount": 1310.40, "currency": "USD"}},
+        {{"description": "HANDLING CHARGE", "amount": 45.00, "currency": "USD"}}
+      ]
+    }},
+    "document_info": {{
+      "document_type": "DEBIT_NOTE",
+      "document_number": "DC-108478"
+    }},
+    "transaction_party": {{
+      "issuer": "签发方",
+      "recipient": "接收方"
+    }},
+    "financial_attributes": {{
+      "posting_type": "AR",
+      "posting_type_reasoning": "应收账款"
+    }},
+    "evidence": [{{
+      "source_file": "文件名",
+      "source_type": "attachment",
+      "original_text": "TOTAL 1,420.40 USD"
+    }}]
+  }}],
+  "excluded_items": []
 }}
 
-注意：
-- 所有金额字段使用数字类型，不要加引号
-- evidence数组至少包含一个元素
-- excluded_items中每个对象必须包含item_type, description, reasoning
+注意：所有金额字段使用数字类型，不要加引号。
 """
+
+
+# ============================================
 
 # 用户提示词模板
 USER_PROMPT_TEMPLATE = """
@@ -158,18 +153,33 @@ def parse_agent_response(response_dict: Dict[str, Any], accounting_entity: str) 
     Returns:
         AgentDecisionBatch对象
     """
+    print(f"\n[Agent Parser] Parsing LLM response...")
+    print(f"  Response keys: {list(response_dict.keys())}")
+    print(f"  Decisions count: {len(response_dict.get('decisions', []))}")
+
     decisions = []
 
-    for dec_data in response_dict.get('decisions', []):
+    for i, dec_data in enumerate(response_dict.get('decisions', []), 1):
         try:
+            print(f"\n  [Decision #{i}]")
+
             # 确保必需字段存在
             charge_details_data = dec_data.get('charge_details', {})
+            print(f"    Charge details keys: {list(charge_details_data.keys())}")
+
             if not charge_details_data.get('original_name'):
-                print(f"Warning: 跳过缺少费用名称的决策")
+                print(f"    ⚠️  Warning: 跳过缺少费用名称的决策")
                 continue
             if not charge_details_data.get('amount'):
-                print(f"Warning: 跳过缺少金额的决策")
+                print(f"    ⚠️  Warning: 跳过缺少金额的决策")
                 continue
+
+            print(f"    Name: {charge_details_data.get('original_name')}")
+            print(f"    Amount: {charge_details_data.get('amount')} {charge_details_data.get('currency')}")
+
+            # 检查 line_items
+            if charge_details_data.get('line_items'):
+                print(f"    Line items: {len(charge_details_data['line_items'])} items")
 
             # 确保evidence不为空
             evidence_list = dec_data.get('evidence', [])
@@ -186,11 +196,12 @@ def parse_agent_response(response_dict: Dict[str, Any], accounting_entity: str) 
             financial_attrs['accounting_entity'] = accounting_entity
 
             # 构建AgentDecision对象
+            # 注意：新 Prompt 不要求 LLM 判断操作类型，这些字段使用默认值
             decision = AgentDecision(
-                suggested_operation=dec_data.get('suggested_operation', 'CREATE'),
-                operation_reasoning=dec_data.get('operation_reasoning', 'No reasoning provided'),
+                suggested_operation=dec_data.get('suggested_operation', 'CREATE'),  # 默认 CREATE
+                operation_reasoning=dec_data.get('operation_reasoning', 'Extracted from document'),
                 matched_record_id=dec_data.get('matched_record_id'),
-                confidence=dec_data.get('confidence', 'MEDIUM'),
+                confidence=dec_data.get('confidence', 'HIGH'),
                 charge_details=ChargeDetails(**charge_details_data),
                 document_info=DocumentInfo(**dec_data.get('document_info', {})),
                 transaction_party=TransactionParty(**dec_data.get('transaction_party', {})),
@@ -199,10 +210,16 @@ def parse_agent_response(response_dict: Dict[str, Any], accounting_entity: str) 
                 field_changes=dec_data.get('field_changes')
             )
             decisions.append(decision)
+            print(f"    ✅ Decision parsed successfully")
+
         except Exception as e:
             # 跳过解析失败的决策
-            print(f"Warning: 跳过一个解析失败的决策: {str(e)}")
+            print(f"    ❌ Error: 跳过一个解析失败的决策: {str(e)}")
+            import traceback
+            traceback.print_exc()
             continue
+
+    print(f"\n[Agent Parser] Total parsed decisions: {len(decisions)}")
 
     # 解析excluded_items，容错处理
     excluded_items = []

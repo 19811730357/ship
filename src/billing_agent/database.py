@@ -17,6 +17,12 @@ except ImportError:
     POSTGRES_AVAILABLE = False
 
 try:
+    import pymysql
+    MYSQL_AVAILABLE = True
+except ImportError:
+    MYSQL_AVAILABLE = False
+
+try:
     import sqlite3
     SQLITE_AVAILABLE = True
 except ImportError:
@@ -33,9 +39,10 @@ class DatabaseManager:
         初始化数据库连接
 
         Args:
-            db_type: 数据库类型 ("sqlite" 或 "postgres")
+            db_type: 数据库类型 ("sqlite", "mysql" 或 "postgres")
             db_config: 数据库配置
                 对于 sqlite: {"database": "billing.db"}
+                对于 mysql: {"host": "localhost", "database": "ship", "user": "...", "password": "..."}
                 对于 postgres: {"host": "localhost", "database": "billing", "user": "...", "password": "..."}
         """
         self.db_type = db_type
@@ -52,6 +59,18 @@ class DatabaseManager:
             db_path = self.db_config.get("database", "billing.db")
             self.conn = sqlite3.connect(db_path, check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
+        elif self.db_type == "mysql":
+            if not MYSQL_AVAILABLE:
+                raise ImportError("pymysql not installed. Run: pip install pymysql")
+            self.conn = pymysql.connect(
+                host=self.db_config.get("host", "localhost"),
+                port=self.db_config.get("port", 3306),
+                user=self.db_config.get("user", "root"),
+                password=self.db_config.get("password", ""),
+                database=self.db_config.get("database", "ship"),
+                charset='utf8mb4',
+                cursorclass=pymysql.cursors.DictCursor
+            )
         elif self.db_type == "postgres":
             if not POSTGRES_AVAILABLE:
                 raise ImportError("psycopg2 not installed. Run: pip install psycopg2-binary")
@@ -78,7 +97,7 @@ class DatabaseManager:
                     payment_method TEXT,
                     posting_type TEXT,
                     accounting_entity TEXT NOT NULL,
-                    record_data TEXT,  -- JSON 格式的完整记录
+                    record_data TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
@@ -93,7 +112,7 @@ class DatabaseManager:
                     model_reasoning TEXT,
                     program_validation TEXT,
                     final_decision TEXT,
-                    decision_data TEXT,  -- JSON 格式
+                    decision_data TEXT,
                     processed_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (record_id) REFERENCES ledger_records(record_id)
                 );
@@ -103,13 +122,65 @@ class DatabaseManager:
                     document_hash TEXT UNIQUE NOT NULL,
                     file_name TEXT,
                     processing_status TEXT,
-                    results TEXT,  -- JSON 格式
+                    results TEXT,
                     processed_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_document_number ON ledger_records(document_number);
                 CREATE INDEX IF NOT EXISTS idx_bill_of_lading ON ledger_records(bill_of_lading);
                 CREATE INDEX IF NOT EXISTS idx_record_id ON ledger_records(record_id);
+            """)
+
+        elif self.db_type == "mysql":
+            # MySQL 表结构
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS ledger_records (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    record_id VARCHAR(50) UNIQUE NOT NULL,
+                    document_number VARCHAR(500),
+                    bill_of_lading VARCHAR(200),
+                    charge_name VARCHAR(200) NOT NULL,
+                    standardized_name VARCHAR(200),
+                    amount DECIMAL(15, 2) NOT NULL,
+                    currency VARCHAR(10) NOT NULL,
+                    payment_method VARCHAR(50),
+                    posting_type VARCHAR(10),
+                    accounting_entity VARCHAR(200) NOT NULL,
+                    record_data TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_document_number (document_number(255)),
+                    INDEX idx_bill_of_lading (bill_of_lading),
+                    INDEX idx_record_id (record_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS processing_history (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    session_id VARCHAR(50),
+                    operation VARCHAR(20) NOT NULL,
+                    record_id VARCHAR(50),
+                    model_suggestion VARCHAR(20),
+                    model_confidence VARCHAR(20),
+                    model_reasoning TEXT,
+                    program_validation VARCHAR(20),
+                    final_decision VARCHAR(20),
+                    decision_data TEXT,
+                    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (record_id) REFERENCES ledger_records(record_id) ON DELETE SET NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS document_processing (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    document_hash VARCHAR(64) UNIQUE NOT NULL,
+                    file_name VARCHAR(255),
+                    processing_status VARCHAR(20),
+                    results TEXT,
+                    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
 
         self.conn.commit()
@@ -147,6 +218,37 @@ class DatabaseManager:
                 record.financial_attributes.accounting_entity,
                 record_data
             ))
+        elif self.db_type == "mysql":
+            cursor.execute("""
+                INSERT INTO ledger_records
+                (record_id, document_number, bill_of_lading, charge_name, standardized_name,
+                 amount, currency, payment_method, posting_type, accounting_entity, record_data)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    document_number = VALUES(document_number),
+                    bill_of_lading = VALUES(bill_of_lading),
+                    charge_name = VALUES(charge_name),
+                    standardized_name = VALUES(standardized_name),
+                    amount = VALUES(amount),
+                    currency = VALUES(currency),
+                    payment_method = VALUES(payment_method),
+                    posting_type = VALUES(posting_type),
+                    accounting_entity = VALUES(accounting_entity),
+                    record_data = VALUES(record_data),
+                    updated_at = CURRENT_TIMESTAMP
+            """, (
+                record.record_id,
+                record.document_info.document_number,
+                record.document_info.bill_of_lading,
+                record.charge_details.original_name,
+                record.charge_details.standardized_name,
+                float(record.charge_details.amount),
+                record.charge_details.currency,
+                record.charge_details.payment_method,
+                record.financial_attributes.posting_type,
+                record.financial_attributes.accounting_entity,
+                record_data
+            ))
 
         self.conn.commit()
         return True
@@ -163,11 +265,18 @@ class DatabaseManager:
         """
         cursor = self.conn.cursor()
 
-        cursor.execute("""
-            SELECT record_data FROM ledger_records
-            WHERE accounting_entity = ?
-            ORDER BY created_at DESC
-        """, (accounting_entity,))
+        if self.db_type == "sqlite":
+            cursor.execute("""
+                SELECT record_data FROM ledger_records
+                WHERE accounting_entity = ?
+                ORDER BY created_at DESC
+            """, (accounting_entity,))
+        elif self.db_type == "mysql":
+            cursor.execute("""
+                SELECT record_data FROM ledger_records
+                WHERE accounting_entity = %s
+                ORDER BY created_at DESC
+            """, (accounting_entity,))
 
         records = []
         for row in cursor.fetchall():
@@ -204,6 +313,16 @@ class DatabaseManager:
                 session_id, operation, record_id, model_suggestion, model_confidence,
                 model_reasoning, program_validation, final_decision, decision_json
             ))
+        elif self.db_type == "mysql":
+            cursor.execute("""
+                INSERT INTO processing_history
+                (session_id, operation, record_id, model_suggestion, model_confidence,
+                 model_reasoning, program_validation, final_decision, decision_data)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                session_id, operation, record_id, model_suggestion, model_confidence,
+                model_reasoning, program_validation, final_decision, decision_json
+            ))
 
         self.conn.commit()
         return True
@@ -222,10 +341,17 @@ class DatabaseManager:
         file_hash = hashlib.sha256(file_content).hexdigest()
 
         cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT results, processed_at FROM document_processing
-            WHERE document_hash = ?
-        """, (file_hash,))
+
+        if self.db_type == "sqlite":
+            cursor.execute("""
+                SELECT results, processed_at FROM document_processing
+                WHERE document_hash = ?
+            """, (file_hash,))
+        elif self.db_type == "mysql":
+            cursor.execute("""
+                SELECT results, processed_at FROM document_processing
+                WHERE document_hash = %s
+            """, (file_hash,))
 
         row = cursor.fetchone()
         if row:
@@ -256,6 +382,17 @@ class DatabaseManager:
                 (document_hash, file_name, processing_status, results)
                 VALUES (?, ?, ?, ?)
             """, (file_hash, file_name, status, results_json))
+        elif self.db_type == "mysql":
+            cursor.execute("""
+                INSERT INTO document_processing
+                (document_hash, file_name, processing_status, results)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    file_name = VALUES(file_name),
+                    processing_status = VALUES(processing_status),
+                    results = VALUES(results),
+                    processed_at = CURRENT_TIMESTAMP
+            """, (file_hash, file_name, status, results_json))
 
         self.conn.commit()
         return True
@@ -264,10 +401,16 @@ class DatabaseManager:
         """根据单据号查询记录"""
         cursor = self.conn.cursor()
 
-        cursor.execute("""
-            SELECT record_data FROM ledger_records
-            WHERE document_number = ?
-        """, (document_number,))
+        if self.db_type == "sqlite":
+            cursor.execute("""
+                SELECT record_data FROM ledger_records
+                WHERE document_number = ?
+            """, (document_number,))
+        elif self.db_type == "mysql":
+            cursor.execute("""
+                SELECT record_data FROM ledger_records
+                WHERE document_number = %s
+            """, (document_number,))
 
         records = []
         for row in cursor.fetchall():
@@ -280,10 +423,16 @@ class DatabaseManager:
         """根据提单号查询记录"""
         cursor = self.conn.cursor()
 
-        cursor.execute("""
-            SELECT record_data FROM ledger_records
-            WHERE bill_of_lading = ?
-        """, (bill_of_lading,))
+        if self.db_type == "sqlite":
+            cursor.execute("""
+                SELECT record_data FROM ledger_records
+                WHERE bill_of_lading = ?
+            """, (bill_of_lading,))
+        elif self.db_type == "mysql":
+            cursor.execute("""
+                SELECT record_data FROM ledger_records
+                WHERE bill_of_lading = %s
+            """, (bill_of_lading,))
 
         records = []
         for row in cursor.fetchall():
@@ -296,14 +445,24 @@ class DatabaseManager:
         """获取处理统计"""
         cursor = self.conn.cursor()
 
-        cursor.execute("""
-            SELECT
-                COUNT(*) as total_records,
-                COUNT(DISTINCT document_number) as unique_documents,
-                COUNT(DISTINCT bill_of_lading) as unique_bls
-            FROM ledger_records
-            WHERE accounting_entity = ?
-        """, (accounting_entity,))
+        if self.db_type == "sqlite":
+            cursor.execute("""
+                SELECT
+                    COUNT(*) as total_records,
+                    COUNT(DISTINCT document_number) as unique_documents,
+                    COUNT(DISTINCT bill_of_lading) as unique_bls
+                FROM ledger_records
+                WHERE accounting_entity = ?
+            """, (accounting_entity,))
+        elif self.db_type == "mysql":
+            cursor.execute("""
+                SELECT
+                    COUNT(*) as total_records,
+                    COUNT(DISTINCT document_number) as unique_documents,
+                    COUNT(DISTINCT bill_of_lading) as unique_bls
+                FROM ledger_records
+                WHERE accounting_entity = %s
+            """, (accounting_entity,))
 
         row = cursor.fetchone()
 

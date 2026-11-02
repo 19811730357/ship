@@ -40,15 +40,34 @@ class TransactionParty(BaseModel):
     payer_description: Optional[str] = Field(None, description="付款方描述原文")
 
 
+class LineItem(BaseModel):
+    """账单明细项"""
+    description: str = Field(description="明细项描述")
+    amount: Decimal = Field(description="金额")
+    currency: str = Field(description="币种")
+    quantity: Optional[Decimal] = Field(None, description="数量")
+    unit_price: Optional[Decimal] = Field(None, description="单价")
+
+    @field_validator('amount', 'quantity', 'unit_price', mode='before')
+    @classmethod
+    def validate_decimal(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float, str)):
+            return Decimal(str(v))
+        return v
+
+
 class ChargeDetails(BaseModel):
     """费用详情"""
     original_name: str = Field(description="原始费用名称")
     standardized_name: Optional[str] = Field(None, description="标准化费用名称")
     quantity: Optional[Decimal] = Field(None, description="数量")
     unit_price: Optional[Decimal] = Field(None, description="单价")
-    amount: Decimal = Field(description="金额")
+    amount: Decimal = Field(description="金额（总金额）")
     currency: str = Field(description="币种，ISO 4217三位代码")
     payment_method: Optional[str] = Field(None, description="付款方式：PP, CC等")
+    line_items: Optional[List['LineItem']] = Field(None, description="账单明细项列表")
 
     @field_validator('amount', 'quantity', 'unit_price', mode='before')
     @classmethod
