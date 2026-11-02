@@ -1,584 +1,372 @@
-"""
-Streamlit Web应用
-航运智能账单助手界面
-"""
+"""Streamlit UI for evidence-based billing previews and validated commits."""
 
-import streamlit as st
+import hashlib
 import json
+import os
 from pathlib import Path
 import sys
-import os
-from dotenv import load_dotenv
+from datetime import date, datetime
 from decimal import Decimal
-from datetime import datetime, date
+from tempfile import TemporaryDirectory
+import uuid
 
-# 加载环境变量
-load_dotenv()
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from billing_agent.runtime import OUTPUT_DIR, ROOT_DIR, TEMP_DIR, configure_runtime, configure_streamlit_storage
 
-# 添加src到路径
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+configure_runtime()
 
-from billing_agent.workflow import BillingWorkflow
-from billing_agent.workflow_db import DatabaseWorkflow  # 数据库版本
-from billing_agent.demo import DEMO_SCENARIOS, get_demo_ledger
+import streamlit as st
+configure_streamlit_storage()
+
+from dotenv import load_dotenv
+
 from billing_agent.agent import is_api_configured
+from billing_agent.demo import DEMO_SCENARIOS
+from billing_agent.workflow import BillingWorkflow
+from billing_agent.workflow_db import DatabaseWorkflow
 
+load_dotenv(ROOT_DIR / ".env")
 
-# ============================================
-# JSON 序列化辅助函数
-# ============================================
 
 def decimal_default(obj):
-    """处理 Decimal 和 datetime 类型的 JSON 序列化"""
+    """Keep exact monetary values at the JSON boundary."""
     if isinstance(obj, Decimal):
-        return float(obj)
+        return str(obj)
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
 def safe_json_dumps(obj, **kwargs):
-    """安全的 JSON 序列化，处理 Decimal 和 datetime 类型"""
     return json.dumps(obj, default=decimal_default, **kwargs)
 
 
-# ============================================
-# 页面配置
-# ============================================
+def context_fingerprint(accounting_entity, mode, use_database, db_type, db_config):
+    context = [accounting_entity, mode, bool(use_database), db_type, db_config]
+    return hashlib.sha256(json.dumps(context, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
-st.set_page_config(
-    page_title="航运智能账单助手 V2",
-    page_icon="🚢",
-    layout="wide"
-)
 
-st.title("🚢 航运智能账单助手 V2")
-st.markdown("**基于大模型决策的智能账单处理系统**")
+def safe_upload_name(filename, index):
+    name = Path(str(filename).replace("\\", "/")).name
+    if name in {"", ".", ".."}:
+        raise ValueError("上传文件名称无效")
+    return f"{index:03d}-{name}"
 
-# ============================================
-# 侧边栏配置
-# ============================================
 
-st.sidebar.header("⚙️ 配置")
+def result_state(result):
+    report = result.get("run_report", {})
+    pending = result.get("summary", {}).get("operations", {}).get("PENDING_REVIEW", 0)
+    active_errors = [issue for issue in report.get("file_errors", [])
+                     if not isinstance(issue, dict) or not issue.get("acknowledged")]
+    failed = report.get("files_failed", 0) or active_errors
+    if failed and not result.get("processing_results"):
+        return "failed"
+    if result.get("committed"):
+        return "partial" if pending or failed else "committed"
+    if result.get("preview_only") or (result.get("preview_only") is None and result.get("preview_id")):
+        return "preview"
+    if pending:
+        return "pending"
+    return "completed"
 
-# 记账主体
-accounting_entity = st.sidebar.text_input(
-    "记账主体",
-    value="Demo Origin",
-    help="当前的记账主体名称"
-)
 
-# 运行模式
-mode = st.sidebar.radio(
-    "运行模式",
-    ["模拟演示", "真实文件处理"],
-    help="模拟模式使用预设场景，不调用API"
-)
+def clear_preview():
+    old_workflow = st.session_state.pop("billing_workflow", None)
+    close = getattr(old_workflow, "close", None)
+    if callable(close):
+        close()
+    st.session_state.pop("billing_result", None)
+    for key in list(st.session_state):
+        if str(key).startswith("review_") or str(key).startswith("commit_"):
+            del st.session_state[key]
 
-use_mock_data = (mode == "模拟演示")
 
-# API配置状态
-st.sidebar.markdown("---")
-st.sidebar.subheader("📡 API状态")
-
-api_configured = is_api_configured()
-if api_configured:
-    st.sidebar.success("✅ 千问API已配置")
-else:
-    st.sidebar.warning("⚠️ 千问API未配置")
-    st.sidebar.info("使用模拟模式或在.env中配置DASHSCOPE_API_KEY")
-
-# 数据库配置
-st.sidebar.markdown("---")
-st.sidebar.subheader("💾 数据库配置")
-
-# 从环境变量读取数据库配置
-db_type_env = os.getenv("DB_TYPE", "sqlite")
-
-use_database = st.sidebar.checkbox(
-    "启用数据库持久化",
-    value=True,
-    help="启用后所有处理结果将保存到数据库，重启后数据不丢失"
-)
-
-if use_database:
-    st.sidebar.success("✅ 数据库已启用")
-
-    # 显示当前配置
-    if db_type_env == "mysql":
-        db_name = os.getenv("DB_NAME", "ship")
-        db_host = os.getenv("DB_HOST", "localhost")
-        db_port = os.getenv("DB_PORT", "3306")
-        st.sidebar.info(f"🗄️ MySQL: {db_name} @ {db_host}:{db_port}")
-        db_type = "mysql"
-        db_config = {
-            "host": db_host,
-            "port": int(db_port),
-            "user": os.getenv("DB_USER", "root"),
-            "password": os.getenv("DB_PASSWORD", ""),
-            "database": db_name
+def database_settings():
+    backend = os.getenv("DB_TYPE", "sqlite").lower()
+    if backend not in {"sqlite", "mysql"}:
+        raise ValueError("当前支持 SQLite 和 MySQL，请将 DB_TYPE 设置为 sqlite 或 mysql")
+    if backend == "mysql":
+        config = {
+            "host": os.getenv("DB_HOST", "localhost"), "port": int(os.getenv("DB_PORT", "3306")),
+            "user": os.getenv("DB_USER", "root"), "password": os.getenv("DB_PASSWORD", ""),
+            "database": os.getenv("DB_NAME", "ship"),
         }
-    elif db_type_env == "postgres":
-        db_name = os.getenv("DB_NAME", "billing")
-        db_host = os.getenv("DB_HOST", "localhost")
-        st.sidebar.info(f"🐘 PostgreSQL: {db_name} @ {db_host}")
-        db_type = "postgres"
-        db_config = {
-            "host": db_host,
-            "database": db_name,
-            "user": os.getenv("DB_USER", "postgres"),
-            "password": os.getenv("DB_PASSWORD", "")
-        }
-    else:  # sqlite
-        db_file = os.getenv("DB_DATABASE", "billing.db")
-        st.sidebar.info(f"📁 SQLite: {db_file}")
-        db_type = "sqlite"
-        db_config = {"database": db_file}
-else:
-    st.sidebar.warning("⚠️ 数据库未启用（重启后数据将丢失）")
-    db_type = None
-    db_config = None
+    else:
+        db_path = Path(os.getenv("DB_DATABASE", str(OUTPUT_DIR / "billing.db")))
+        if not db_path.is_absolute():
+            db_path = ROOT_DIR / db_path
+        if db_path.drive.upper() != ROOT_DIR.drive.upper():
+            raise ValueError("SQLite 数据库必须放在项目所在的 D 盘")
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        config = {"database": str(db_path)}
+    return backend, config
 
 
-# ============================================
-# 主界面
-# ============================================
-
-if mode == "模拟演示":
-    st.header("📋 模拟演示模式")
-
-    st.info("""
-    **演示模式说明**：使用预设场景展示系统功能，不调用真实API。
-
-    **核心特性展示**：
-    - ✨ 模型给出操作建议（CREATE/UPDATE/NO_CHANGE）
-    - 🔍 程序独立验证决策
-    - ⚖️ 模型与程序冲突时智能解决
-    - 📊 完整的决策过程追踪
-    """)
-
-    # 场景选择
-    st.subheader("选择演示场景")
-
-    scenario_cols = st.columns(2)
-
-    for i, (scenario_key, scenario_info) in enumerate(DEMO_SCENARIOS.items()):
-        col = scenario_cols[i % 2]
-
-        with col:
-            st.markdown(f"**{scenario_info['name']}**")
-            st.caption(scenario_info['description'])
-
-            if st.button(f"运行此场景", key=f"btn_{scenario_key}"):
-                st.session_state['selected_scenario'] = scenario_key
-
-    # 运行场景
-    if 'selected_scenario' in st.session_state:
-        scenario_key = st.session_state['selected_scenario']
-        scenario_info = DEMO_SCENARIOS[scenario_key]
-
-        st.markdown("---")
-        st.subheader(f"🎬 运行场景：{scenario_info['name']}")
-
-        with st.spinner("处理中..."):
-            try:
-                # 创建工作流
-                workflow = BillingWorkflow(
-                    accounting_entity=accounting_entity,
-                    use_mock_data=True
-                )
-
-                # 处理场景
-                output_dir = Path("output") / scenario_key
-                results = workflow.process_demo_scenario(scenario_key, output_dir)
-
-                # 显示结果
-                st.success("✅ 处理完成！")
-
-                # 显示摘要
-                col1, col2, col3, col4 = st.columns(4)
-
-                summary = results['summary']
-                col1.metric("CREATE", summary['operations']['CREATE'])
-                col2.metric("UPDATE", summary['operations']['UPDATE'])
-                col3.metric("NO_CHANGE", summary['operations']['NO_CHANGE'])
-                col4.metric("PENDING_REVIEW", summary['operations']['PENDING_REVIEW'])
-
-                # 显示详细结果
-                st.subheader("📊 处理结果详情")
-
-                for i, result in enumerate(results['processing_results']):
-                    with st.expander(
-                        f"费用 #{i+1}: {result['charge_details']['original_name']} - {result['operation']}",
-                        expanded=(i == 0)
-                    ):
-                        # 操作类型
-                        op_type = result['operation']
-                        if op_type == "CREATE":
-                            st.success(f"✨ **操作**: {op_type}")
-                        elif op_type == "UPDATE":
-                            st.info(f"🔄 **操作**: {op_type}")
-                        elif op_type == "NO_CHANGE":
-                            st.info(f"➡️ **操作**: {op_type}")
-                        else:
-                            st.warning(f"⚠️ **操作**: {op_type}")
-
-                        # 决策过程
-                        st.markdown("##### 🤖 模型决策")
-                        st.write(f"- **建议操作**: {result['model_suggestion']}")
-                        st.write(f"- **置信度**: {result['model_confidence']}")
-                        st.write(f"- **理由**: {result['model_reasoning']}")
-
-                        st.markdown("##### 🔍 程序验证")
-                        st.write(f"- **程序判断**: {result['program_validation']}")
-                        if result['validation_issues']:
-                            st.write(f"- **验证问题**: {', '.join(result['validation_issues'])}")
-                        else:
-                            st.write("- **验证问题**: 无")
-
-                        if result['conflict_resolution']:
-                            st.markdown("##### ⚖️ 冲突解决")
-                            st.write(result['conflict_resolution'])
-
-                        # 费用详情
-                        st.markdown("##### 💰 费用详情")
-                        charge = result['charge_details']
-                        st.write(f"- **金额**: {charge['amount']} {charge['currency']}")
-                        st.write(f"- **付款方式**: {charge.get('payment_method', 'N/A')}")
-
-                        # 单据信息
-                        doc = result['document_info']
-                        if doc.get('document_number'):
-                            st.markdown("##### 📄 单据信息")
-                            st.write(f"- **单据号**: {doc['document_number']}")
-                            if doc.get('bill_of_lading'):
-                                st.write(f"- **提单号**: {doc['bill_of_lading']}")
-
-                # 排除项
-                if summary['excluded_items'] > 0:
-                    st.subheader("🚫 排除项")
-                    st.info(f"共 {summary['excluded_items']} 项被排除（如条件条款、汇总行等）")
-
-                # 下载按钮
-                st.subheader("📥 下载结果")
-
-                col1, col2, col3 = st.columns(3)
-
-                with col1:
-                    st.download_button(
-                        label="下载处理结果",
-                        data=safe_json_dumps(results['processing_results'], indent=2, ensure_ascii=False),
-                        file_name="processing_results.json",
-                        mime="application/json"
-                    )
-
-                with col2:
-                    st.download_button(
-                        label="下载账本快照",
-                        data=safe_json_dumps(results['ledger_snapshot'], indent=2, ensure_ascii=False),
-                        file_name="ledger_snapshot.json",
-                        mime="application/json"
-                    )
-
-                with col3:
-                    st.download_button(
-                        label="下载运行报告",
-                        data=safe_json_dumps(results['run_report'], indent=2, ensure_ascii=False),
-                        file_name="run_report.json",
-                        mime="application/json"
-                    )
-
-            except Exception as e:
-                st.error(f"处理失败: {str(e)}")
-                st.exception(e)
-
-else:
-    # 真实文件处理模式
-    st.header("📁 真实文件处理")
-
-    if not api_configured:
-        st.error("""
-        ❌ **真实文件处理需要配置API密钥**
-
-        请按以下步骤操作：
-        1. 复制 `.env.example` 为 `.env`
-        2. 在 `.env` 中填写 `DASHSCOPE_API_KEY`
-        3. 重启应用
-        """)
-        st.stop()
-
-    st.info("""
-    **支持的文件格式**：
-    - 📧 EML邮件文件
-    - 📄 PDF文档
-    - 📊 Excel表格（.xlsx, .xls, .csv）
-    - 📝 Word文档（.docx）
-    - 📃 纯文本（.txt）
-    - 🖼️ 图片（.png, .jpg等，需OCR）
-    """)
-
-    # 文件上传区域
-    st.subheader("1️⃣ 上传材料文件")
-
-    uploaded_files = st.file_uploader(
-        "选择要处理的文件",
-        type=['eml', 'pdf', 'xlsx', 'xls', 'csv', 'docx', 'txt', 'png', 'jpg', 'jpeg'],
-        accept_multiple_files=True,
-        help="可以同时上传多个文件，系统会合并处理"
-    )
-
-    # 旧账导入
-    st.subheader("2️⃣ 导入旧账（可选）")
-
-    col1, col2 = st.columns([3, 1])
-
-    with col1:
-        ledger_file = st.file_uploader(
-            "上传旧账JSON文件",
-            type=['json'],
-            help="如果有旧账数据，上传JSON格式的账本文件"
-        )
-
-    with col2:
-        use_empty_ledger = st.checkbox("使用空账本", value=True, help="不导入旧账，从空账本开始")
-        force_reprocess = st.checkbox("强制重新处理", value=False, help="即使文件已处理过也重新处理")
-
-    # 处理按钮
-    st.subheader("3️⃣ 开始处理")
-
-    # 使用 session_state 追踪处理次数
-    if 'process_count' not in st.session_state:
-        st.session_state.process_count = 0
-
-    if st.button("🚀 开始处理", type="primary", disabled=not uploaded_files, key=f"process_btn_{st.session_state.process_count}"):
-        if not uploaded_files:
-            st.warning("请先上传至少一个文件")
+def get_workflow(accounting_entity, mode, use_database, db_type, db_config):
+    if "billing_workflow" not in st.session_state:
+        if mode == "真实文件处理" and use_database:
+            workflow = DatabaseWorkflow(accounting_entity=accounting_entity, use_mock_data=False,
+                                        db_type=db_type, db_config=db_config)
         else:
-            # 增加处理计数
-            st.session_state.process_count += 1
+            workflow = BillingWorkflow(accounting_entity=accounting_entity, use_mock_data=(mode == "模拟演示"))
+        st.session_state["billing_workflow"] = workflow
+    return st.session_state["billing_workflow"]
 
-            with st.spinner("正在处理文件..."):
+
+def render_source_documents(result):
+    with st.expander("原始材料与解析证据", expanded=False):
+        sources = result.get("source_documents", [])
+        if not sources:
+            st.caption("本次结果没有附带原文块，请在每条费用下查看证据。")
+        for source in sources:
+            st.write(source.get("source_file", source.get("file_name", source.get("source_id", "材料"))))
+            if source.get("source_id"):
+                st.caption(f"来源 ID：{source['source_id']}")
+            blocks = source.get("blocks", [])
+            if blocks:
+                for block in blocks:
+                    location = block.get("location") or f"页 {block.get('page', '?')} / 行 {block.get('row', '?')}"
+                    st.caption(f"{block.get('block_id', '')} · {location}")
+                    st.text(block.get("text", ""))
+            elif source.get("content"):
+                st.text(source["content"])
+            if source.get("errors"):
+                st.error(safe_json_dumps(source["errors"], ensure_ascii=False))
+
+
+def candidate_label(candidate):
+    charge = candidate.get("charge_details", {})
+    doc = candidate.get("document_info", {})
+    return (f"{candidate.get('record_id', '?')} · {doc.get('document_number') or '无单据号'} · "
+            f"{charge.get('original_name', '?')} · {charge.get('amount', '?')} {charge.get('currency', '')}")
+
+
+def render_results(result):
+    state = result_state(result)
+    messages = {
+        "failed": (st.error, "本次处理失败，请查看错误信息后重试。"),
+        "preview": (st.info, "预览已生成，账本尚未写入。核对变更和待复核项后提交。"),
+        "committed": (st.success, "已通过校验的变更已提交。"),
+        "partial": (st.warning, "已提交通过校验的变更；仍有待复核或失败项，请继续处理。"),
+        "pending": (st.warning, "本次未提交费用变更，仍有待复核项。"),
+        "completed": (st.info, "处理已结束，请核对下面的操作状态。"),
+    }
+    show, message = messages[state]
+    show(message)
+    operations = result.get("summary", {}).get("operations", {})
+    for column, name in zip(st.columns(4), ("CREATE", "UPDATE", "NO_CHANGE", "PENDING_REVIEW")):
+        column.metric(name, operations.get(name, 0))
+    report = result.get("run_report", {})
+    for error in report.get("file_errors", []):
+        if isinstance(error, dict):
+            source_name = error.get("file", error.get("source_file", "处理错误"))
+            if error.get("acknowledged"):
+                note = error.get("review_note", error.get("human_note", ""))
+                st.caption(f"来源问题已人工确认与本次费用无关：{source_name}。依据：{note}")
+            else:
+                st.error(f"{source_name}：{error.get('error', error.get('message', '失败'))}")
+        else:
+            st.error(str(error))
+    if report.get("files_skipped"):
+        st.caption(f"本次跳过已处理文件 {report['files_skipped']} 个。")
+    if report.get("excluded_items"):
+        with st.expander("未入账的汇总、条件收费和其他排除项", expanded=False):
+            for excluded in report["excluded_items"]:
+                st.write(excluded.get("description", "排除项"))
+                st.write(excluded.get("reasoning", ""))
+                for evidence in excluded.get("evidence", []):
+                    st.caption(evidence.get("source_file", ""))
+                    st.text(evidence.get("original_text", ""))
+    render_source_documents(result)
+    items = result.get("processing_results", [])
+    if not items:
+        st.warning("本次没有可展示的费用结果；这不代表账单金额为零。")
+    for index, item in enumerate(items):
+        charge = item.get("charge_details", {})
+        with st.expander(f"费用 {index + 1}：{charge.get('original_name') or '未识别费用'} · {item.get('operation', 'UNKNOWN')}",
+                         expanded=(index == 0 or item.get("operation") == "PENDING_REVIEW")):
+            st.write(f"金额：{charge.get('amount', '未知')} {charge.get('currency') or '币种未知'}")
+            st.write(f"单据号：{item.get('document_info', {}).get('document_number') or '未知'}")
+            st.write(item.get("reason", ""))
+            if item.get("validation_issues"):
+                st.warning(safe_json_dumps(item["validation_issues"], ensure_ascii=False))
+            if item.get("patch"):
+                st.write("拟修改字段")
+                st.table([{"字段": field, "旧值": str(change.get("old")), "新值": str(change.get("new"))}
+                          for field, change in item["patch"].items() if isinstance(change, dict)])
+            for evidence in item.get("evidence", []):
+                st.caption(f"{evidence.get('source_file', '')} · {evidence.get('location') or evidence.get('block_id') or '位置未提供'}")
+                st.text(evidence.get("original_text", ""))
+            if item.get("candidates"):
+                st.write("候选旧账")
+                for candidate in item["candidates"]:
+                    st.write(candidate_label(candidate))
+                    st.json(candidate)
+    stats = result.get("database_stats")
+    if stats:
+        st.caption(f"当前账本记录：{stats.get('total_records', 0)}；单据：{stats.get('unique_documents', 0)}")
+    st.caption(f"解析文件：{report.get('files_succeeded', 0)}；失败：{report.get('files_failed', 0)}；待复核不等于已记账。")
+
+
+def render_commit_form(result, workflow):
+    pending = result.get("summary", {}).get("operations", {}).get("PENDING_REVIEW", 0)
+    source_issues = result.get("run_report", {}).get("file_errors", [])
+    reviewable_sources = any(isinstance(issue, dict) and issue.get("reviewable") and not issue.get("acknowledged")
+                             for issue in source_issues)
+    if not result.get("preview_id") or (result.get("committed") and not pending and not reviewable_sources):
+        return
+    preview_id = str(result["preview_id"])
+    actions = {}
+    source_reviews = []
+    with st.form(f"commit_form_{preview_id}"):
+        st.write("提交与人工复核")
+        for issue_index, issue in enumerate(source_issues):
+            if not isinstance(issue, dict) or not issue.get("reviewable") or issue.get("acknowledged"):
+                continue
+            source_name = issue.get("file", issue.get("source_file", issue.get("attachment", "来源材料")))
+            st.write(f"来源问题：{source_name} · {issue.get('error', issue.get('message', '解析失败'))}")
+            exclude = st.checkbox("已核对，与本次费用无关", key=f"review_source_exclude_{preview_id}_{issue_index}")
+            note = st.text_area("说明与费用无关的依据", key=f"review_source_note_{preview_id}_{issue_index}",
+                                help="仅可排除已核对的无关附件或素材；无法确认时不要勾选。金额、模型提取和单据合计错误仍须解决。")
+            if exclude:
+                source_reviews.append({"issue_index": issue_index, "note": note.strip(), "exclude": True})
+        for index, item in enumerate(result.get("processing_results", [])):
+            if item.get("operation") != "PENDING_REVIEW":
+                continue
+            item_id = str(item.get("item_id", index))
+            charge, doc = item.get("charge_details", {}), item.get("document_info", {})
+            candidates = item.get("candidates", [])
+            by_id = {str(candidate["record_id"]): candidate for candidate in candidates}
+            def label(value):
+                if value == "keep_pending":
+                    return "保留待复核"
+                if value == "create":
+                    return "人工确认这是新增费用"
+                return candidate_label(by_id[value])
+            st.write(f"费用 {index + 1}：{charge.get('original_name', '未识别费用')}")
+            selection = st.selectbox("关联旧账或确认新增", ["keep_pending", "create"] + list(by_id),
+                                     format_func=label, key=f"review_target_{preview_id}_{item_id}")
+            values = {}
+            fields = [
+                ("amount", "核对后的金额", str(charge.get("amount", "") if charge.get("amount") is not None else "")),
+                ("currency", "核对后的币种", charge.get("currency") or ""),
+                ("issuer", "核对后的签发方", item.get("transaction_party", {}).get("issuer") or ""),
+                ("document_number", "核对后的单据号", doc.get("document_number") or ""),
+                ("standardized_name", "核对后的标准费用代码", charge.get("standardized_name") or ""),
+            ]
+            for field, field_label, default in fields:
+                values[field] = st.text_input(field_label, value=default, key=f"review_{field}_{preview_id}_{item_id}").strip()
+            direction = item.get("financial_attributes", {}).get("posting_type")
+            posting_type = st.selectbox("核对后的应收／应付", ["未知", "AR", "AP"],
+                                        index={"AR": 1, "AP": 2}.get(direction, 0), key=f"review_posting_{preview_id}_{item_id}")
+            note = st.text_area("人工复核依据", key=f"review_note_{preview_id}_{item_id}",
+                                help="说明费用身份、金额、币种及交易方向的依据；仍不明确时保留待复核。")
+            if selection != "keep_pending":
+                actions[item_id] = {
+                    "record_id": selection if selection != "create" else None, "approve_create": selection == "create",
+                    **{key: value for key, value in values.items() if value or key in {"amount", "currency"}},
+                    **({"posting_type": posting_type} if posting_type != "未知" else {}), "note": note.strip(),
+                }
+        acknowledge = st.checkbox("我已核对上述变更与来源依据", key=f"commit_ack_{preview_id}")
+        submit = st.form_submit_button("提交已通过校验的变更", type="primary")
+    if submit:
+        if not acknowledge:
+            st.warning("请先核对并勾选提交确认。")
+            return
+        if any(not action["note"] for action in actions.values()):
+            st.warning("人工处理的费用需要填写复核依据。")
+            return
+        if any(not review["note"] for review in source_reviews):
+            st.warning("确认来源问题与费用无关时，需要填写人工核对依据。")
+            return
+        if source_reviews:
+            actions["__source_reviews__"] = source_reviews
+        try:
+            st.session_state["billing_result"] = workflow.commit_preview(preview_id, review_actions=actions or None)
+            st.rerun()
+        except Exception as exc:
+            st.error(f"提交未完成：{exc}。请重新核对当前账本后生成预览。")
+
+
+def render_downloads(result):
+    st.write("下载")
+    for column, field, label in zip(st.columns(3), ("processing_results", "ledger_snapshot", "run_report"),
+                                    ("下载处理结果", "下载完整账本快照", "下载运行报告")):
+        with column:
+            if field in result:
+                st.download_button(label, safe_json_dumps(result[field], indent=2, ensure_ascii=False),
+                                   file_name=f"{field}.json", mime="application/json", key=f"download_{field}")
+
+
+def main():
+    st.set_page_config(page_title="航运智能账单助手 V2", page_icon="🚢", layout="wide")
+    st.title("航运智能账单助手 V2")
+    st.caption("逐条提取费用，核对旧账与修改依据，校验后提交。")
+    accounting_entity = st.sidebar.text_input("记账主体", value="Demo Origin", key="accounting_entity").strip()
+    mode = st.sidebar.radio("运行模式", ["模拟演示", "真实文件处理"], key="processing_mode")
+    use_database = st.sidebar.checkbox("启用数据库持久化", value=True, key="use_database")
+    db_type, db_config = None, None
+    if use_database and mode == "真实文件处理":
+        try:
+            db_type, db_config = database_settings()
+            st.sidebar.caption(f"数据库：{db_type} / {db_config['database']}")
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+    fingerprint = context_fingerprint(accounting_entity, mode, use_database, db_type, db_config)
+    if st.session_state.get("billing_context") != fingerprint:
+        clear_preview()
+        st.session_state["billing_context"] = fingerprint
+    if not accounting_entity:
+        st.warning("请先填写记账主体。")
+        st.stop()
+    if mode == "模拟演示":
+        st.info("演示使用固定材料与模型结果，通过同一校验和提交流程处理，不调用外部服务。")
+        for scenario_key, info in DEMO_SCENARIOS.items():
+            st.write(info["name"])
+            st.caption(info["description"])
+            if st.button("运行此场景", key=f"btn_{scenario_key}"):
                 try:
-                    # 保存上传的文件到临时目录
-                    import tempfile
-                    temp_dir = Path(tempfile.mkdtemp())
-                    file_paths = []
-
-                    for uploaded_file in uploaded_files:
-                        file_path = temp_dir / uploaded_file.name
-                        with open(file_path, 'wb') as f:
-                            f.write(uploaded_file.getbuffer())
-                        file_paths.append(file_path)
-
-                    st.info(f"已上传 {len(file_paths)} 个文件")
-
-                    # 加载旧账
-                    ledger_data = None
-                    if ledger_file and not use_empty_ledger:
-                        ledger_data = json.loads(ledger_file.read().decode('utf-8'))
-                        st.info("已加载旧账数据")
-                    else:
-                        if use_database:
-                            st.info("将从数据库加载历史记录")
-                        else:
-                            st.info("使用空账本")
-
-                    # 创建工作流（根据是否启用数据库选择不同的工作流）
-                    if use_database:
-                        workflow = DatabaseWorkflow(
-                            accounting_entity=accounting_entity,
-                            use_mock_data=False,
-                            db_type=db_type,
-                            db_config=db_config
-                        )
-                        st.success(f"✅ 使用数据库工作流: {db_type}")
-                    else:
-                        workflow = BillingWorkflow(
-                            accounting_entity=accounting_entity,
-                            use_mock_data=False
-                        )
-                        st.warning("⚠️ 未启用数据库（重启后数据将丢失）")
-
-                    # 处理文件
-                    output_dir = Path("output") / f"real_processing_{st.session_state.process_count}"
-                    results = workflow.process_real_files(
-                        file_paths=file_paths,
-                        ledger_data=ledger_data,
-                        output_dir=output_dir,
-                        force_reprocess=force_reprocess
-                    )
-
-                    # 显示结果
-                    st.success("✅ 处理完成！")
-
-                    # 显示摘要
-                    st.subheader("📊 处理摘要")
-                    col1, col2, col3, col4 = st.columns(4)
-
-                    summary = results.get('summary', {})
-                    operations = summary.get('operations', {
-                        'CREATE': 0,
-                        'UPDATE': 0,
-                        'NO_CHANGE': 0,
-                        'PENDING_REVIEW': 0
-                    })
-
-                    col1.metric("CREATE", operations.get('CREATE', 0))
-                    col2.metric("UPDATE", operations.get('UPDATE', 0))
-                    col3.metric("NO_CHANGE", operations.get('NO_CHANGE', 0))
-                    col4.metric("PENDING_REVIEW", operations.get('PENDING_REVIEW', 0))
-
-                    # 显示详细结果
-                    st.subheader("📋 处理结果详情")
-
-                    processing_results = results.get('processing_results', [])
-
-                    if not processing_results:
-                        st.info("没有处理结果")
-                    else:
-                        for i, result in enumerate(processing_results):
-                            charge_details = result.get('charge_details', {})
-                            operation = result.get('operation', 'UNKNOWN')
-
-                            with st.expander(
-                                f"费用 #{i+1}: {charge_details.get('original_name', 'Unknown')} - {operation}",
-                                expanded=(i == 0)
-                            ):
-                                # 操作类型
-                                op_type = result.get('operation', 'UNKNOWN')
-                                if op_type == "CREATE":
-                                    st.success(f"✨ **操作**: {op_type}")
-                                elif op_type == "UPDATE":
-                                    st.info(f"🔄 **操作**: {op_type}")
-                                elif op_type == "NO_CHANGE":
-                                    st.info(f"➡️ **操作**: {op_type}")
-                                elif op_type == "PENDING_REVIEW":
-                                    st.error(f"⚠️ **操作**: {op_type} - 需人工审核")
-                                else:
-                                    st.warning(f"⚠️ **操作**: {op_type}")
-
-                                # 显示基本信息
-                                st.markdown("##### 💰 费用详情")
-                                st.write(f"- **费用名称**: {charge_details.get('original_name', 'N/A')}")
-                                st.write(f"- **金额**: {charge_details.get('amount', 0)} {charge_details.get('currency', 'N/A')}")
-
-                                # 单据信息
-                                doc_info = result.get('document_info', {})
-                                if doc_info.get('document_number'):
-                                    st.write(f"- **单据号**: {doc_info.get('document_number')}")
-
-                                # 原因
-                                if result.get('reason'):
-                                    st.markdown("##### 📝 决策原因")
-                                    st.write(result.get('reason'))
-
-                                # 验证问题（PENDING_REVIEW 时显示）
-                                if result.get('validation_issues'):
-                                    st.markdown("##### ⚠️ 验证问题")
-                                    issues = result.get('validation_issues', {})
-                                    st.error(f"账单总额与明细不符：")
-                                    col1, col2, col3 = st.columns(3)
-                                    col1.metric("声明总额", f"{issues.get('declared_total', 0):.2f}")
-                                    col2.metric("明细合计", f"{issues.get('calculated_total', 0):.2f}")
-                                    col3.metric("差额", f"{issues.get('difference', 0):.2f}", delta_color="off")
-                                    st.warning(f"📋 明细项数量: {issues.get('line_items_count', 0)}")
-
-                    # 排除项
-                    if summary.get('excluded_items', 0) > 0:
-                        st.subheader("🚫 排除项")
-                        st.info(f"共 {summary['excluded_items']} 项被排除（如条件条款、汇总行等）")
-
-                    # 数据库统计（如果启用了数据库）
-                    if use_database and 'database_stats' in results:
-                        st.subheader("💾 数据库统计")
-                        db_stats = results['database_stats']
-
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("📊 总记录数", db_stats['total_records'])
-                        col2.metric("📄 唯一单据数", db_stats['unique_documents'])
-                        col3.metric("🚢 唯一提单数", db_stats['unique_bls'])
-
-                        st.success("✅ 所有数据已持久化到数据库，重启后依然可用")
-
-                        if 'session_id' in results:
-                            st.caption(f"🔖 会话ID: {results['session_id']}")
-
-                    # 运行报告
-                    if 'run_report' in results:
-                        st.subheader("📈 运行报告")
-                        report = results['run_report']
-
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("文件总数", report.get('files_processed', 0))
-                        col2.metric("成功", report.get('files_succeeded', 0))
-                        col3.metric("失败", report.get('files_failed', 0))
-
-                        if report.get('file_errors'):
-                            st.error("文件处理错误:")
-                            for err in report['file_errors']:
-                                st.write(f"- {err.get('file', 'Unknown')}: {err.get('error', 'Unknown error')}")
-
-                    # 下载按钮
-                    st.subheader("📥 下载结果")
-
-                    col1, col2, col3 = st.columns(3)
-
-                    with col1:
-                        if 'processing_results' in results:
-                            st.download_button(
-                                label="下载处理结果",
-                                data=safe_json_dumps(results['processing_results'], indent=2, ensure_ascii=False),
-                                file_name="processing_results.json",
-                                mime="application/json"
-                            )
-
-                    with col2:
-                        if 'ledger_snapshot' in results:
-                            st.download_button(
-                                label="下载账本快照",
-                                data=safe_json_dumps(results['ledger_snapshot'], indent=2, ensure_ascii=False),
-                                file_name="ledger_snapshot.json",
-                                mime="application/json"
-                            )
-
-                    with col3:
-                        if 'run_report' in results:
-                            st.download_button(
-                                label="下载运行报告",
-                                data=safe_json_dumps(results['run_report'], indent=2, ensure_ascii=False),
-                                file_name="run_report.json",
-                                mime="application/json"
-                            )
-
-                    # 清理临时文件
-                    import shutil
-                    try:
-                        shutil.rmtree(temp_dir)
-                    except:
-                        pass
-
-                except Exception as e:
-                    st.error(f"❌ 处理失败: {str(e)}")
-                    st.exception(e)
+                    workflow = get_workflow(accounting_entity, mode, False, None, None)
+                    st.session_state["billing_result"] = workflow.process_demo_scenario(scenario_key, OUTPUT_DIR / "demo" / scenario_key)
+                except Exception as exc:
+                    st.error(f"演示失败：{exc}")
+    else:
+        api_configured = is_api_configured()
+        st.sidebar.caption("模型密钥：已设置" if api_configured else "模型密钥：未设置")
+        st.info("上传 EML、PDF、Excel/CSV、DOCX、TXT 或图片。扫描 PDF 和图片需要配置 OCR 与对象存储。")
+        uploaded_files = st.file_uploader("材料文件", type=["eml", "pdf", "xlsx", "xls", "csv", "docx", "txt", "png", "jpg", "jpeg"], accept_multiple_files=True)
+        ledger_file = st.file_uploader("导入完整旧账快照（可选）", type=["json"])
+        force_reprocess = st.checkbox("重新解析已处理文件", value=False, help="重新解析不会授权重复记账或覆盖旧账。")
+        allow_updates = st.checkbox("允许根据明确修订依据提出自动更新", value=False,
+                                    help="仍须唯一匹配、证据及金额校验通过；有歧义的费用保留待复核。")
+        st.caption("每次处理先生成预览，点击提交后才应用已通过校验的变更。")
+        if st.button("生成处理预览", type="primary", disabled=not uploaded_files or not api_configured):
+            try:
+                ledger_data = json.loads(ledger_file.getvalue().decode("utf-8-sig")) if ledger_file else None
+                workflow = get_workflow(accounting_entity, mode, use_database, db_type, db_config)
+                with st.spinner("解析材料并生成变更方案..."):
+                    with TemporaryDirectory(prefix="billing-upload-", dir=TEMP_DIR) as staging:
+                        paths = []
+                        for index, uploaded in enumerate(uploaded_files, 1):
+                            path = Path(staging) / safe_upload_name(uploaded.name, index)
+                            path.write_bytes(uploaded.getbuffer())
+                            paths.append(path)
+                        result = workflow.process_real_files(file_paths=paths, ledger_data=ledger_data,
+                            output_dir=OUTPUT_DIR / "runs" / uuid.uuid4().hex,
+                            force_reprocess=force_reprocess, preview_only=True, allow_updates=allow_updates)
+                st.session_state["billing_result"] = result
+            except Exception as exc:
+                st.session_state.pop("billing_result", None)
+                st.error(f"处理失败：{exc}")
+        if not api_configured:
+            st.warning("真实提取需要在项目 .env 中配置模型密钥；当前仍可运行离线演示。")
+    result = st.session_state.get("billing_result")
+    if result is not None:
+        render_results(result)
+        render_commit_form(result, st.session_state["billing_workflow"])
+        render_downloads(result)
 
 
-# ============================================
-# 页脚
-# ============================================
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("""
-### 📚 关于本系统
-
-**版本**: 2.0.0
-
-**核心特点**:
-- 模型主导决策
-- 程序验证保障
-- 冲突智能解决
-- 完整审计追踪
-
-**文档**: 查看 `docs/` 目录
-
-**技术栈**: LangChain, Pydantic, Streamlit
-""")
+if __name__ == "__main__":
+    main()

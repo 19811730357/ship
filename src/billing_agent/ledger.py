@@ -61,14 +61,9 @@ def resolve_operation(
 
     # 策略3: 模型更乐观（UPDATE vs PENDING_REVIEW）
     elif model_op == "UPDATE" and program_op == "PENDING_REVIEW":
-        if agent_decision.confidence == "HIGH":
-            conflict_resolution = "程序发现歧义，但模型高置信度，采纳UPDATE"
-            final_op = "UPDATE"
-            record_id = agent_decision.matched_record_id
-        else:
-            conflict_resolution = "存在歧义且模型置信度不高，谨慎处理"
-            final_op = "PENDING_REVIEW"
-            record_id = None
+        conflict_resolution = "存在歧义，模型置信度不能替代程序校验"
+        final_op = "PENDING_REVIEW"
+        record_id = None
 
     # 策略4: 模型说CREATE但程序说有匹配
     elif model_op == "CREATE" and program_op in ["UPDATE", "NO_CHANGE"]:

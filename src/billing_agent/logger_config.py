@@ -3,10 +3,33 @@
 提供彩色、格式化的日志输出
 """
 
+from .runtime import configure_runtime, LOG_DIR
+configure_runtime()
+
 import logging
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+
+def _redact(value):
+    if isinstance(value, dict):
+        return {key: ("[redacted]" if any(word in str(key).lower()
+                    for word in ("password", "secret", "token", "api_key", "authorization", "access_key"))
+                    else _redact(item)) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact(item) for item in value]
+    if isinstance(value, str):
+        def clean(match):
+            try:
+                parts = urlsplit(match.group(0))
+                return urlunsplit((parts.scheme, parts.hostname or "", parts.path, "", ""))
+            except ValueError:
+                return "[url redacted]"
+        return re.sub(r'https?://[^\s"\']+', clean, value)
+    return value
 
 # ANSI 颜色代码
 class LogColors:
@@ -73,7 +96,7 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger.addHandler(console_handler)
 
     # 文件输出（可选）
-    log_dir = Path("logs")
+    log_dir = LOG_DIR
     log_dir.mkdir(exist_ok=True)
 
     file_handler = logging.FileHandler(
@@ -121,7 +144,7 @@ def log_dict(logger: logging.Logger, data: dict, title: str = None, level: int =
         logger.log(level, f"\n{title}:")
 
     import json
-    formatted = json.dumps(data, indent=2, ensure_ascii=False, default=str)
+    formatted = json.dumps(_redact(data), indent=2, ensure_ascii=False, default=str)
     for line in formatted.split('\n'):
         logger.log(level, f"  {line}")
 
@@ -139,7 +162,7 @@ def log_list(logger: logging.Logger, items: list, title: str = None, level: int 
     if title:
         logger.log(level, f"\n{title}:")
 
-    for i, item in enumerate(items, 1):
+    for i, item in enumerate(_redact(items), 1):
         logger.log(level, f"  {i}. {item}")
 
 

@@ -3,12 +3,16 @@
 OCR和OSS适配器
 """
 
+from .runtime import configure_runtime
+configure_runtime()
+
 from typing import Optional, Dict, Any
 import os
+import uuid
 import requests
 import oss2
 from pathlib import Path
-from .logger_config import get_ocr_logger, log_dict
+from .logger_config import get_ocr_logger
 
 logger = get_ocr_logger()
 
@@ -17,13 +21,13 @@ class OCRAdapter:
     """OCR服务适配器"""
 
     def __init__(self):
-        self.url = os.getenv("OCR_URL", "https://gateway.pltplt.com/ai/process")
+        self.url = os.getenv("OCR_URL", "")
         self.token = os.getenv("OCR_TOKEN", "")
+        self.token_header = os.getenv("OCR_TOKEN_HEADER", "Authorization")
         self.timeout_connect = int(os.getenv("OCR_CONNECT_TIMEOUT", "10"))
         self.timeout_read = int(os.getenv("OCR_TIMEOUT", "300"))
 
         logger.info(f"OCR Adapter initialized")
-        logger.debug(f"  URL: {self.url}")
         logger.debug(f"  Token configured: {bool(self.token)}")
         logger.debug(f"  Timeout: {self.timeout_read}s")
 
@@ -53,7 +57,6 @@ class OCRAdapter:
             OCR结果字典
         """
         logger.info(f"🔍 Starting OCR processing")
-        logger.info(f"  File: {file_url}")
         logger.info(f"  Task: {task}")
 
         if not self.url:
@@ -67,43 +70,38 @@ class OCRAdapter:
             "taskType": task_type
         }
 
-        logger.debug("📤 Sending OCR request...")
-        log_dict(logger, data, "Request data", level=10)  # DEBUG level
+        headers = {}
+        if self.token:
+            value = self.token
+            if self.token_header.lower() == "authorization" and not value.lower().startswith("bearer "):
+                value = "Bearer " + value
+            headers[self.token_header] = value
 
         try:
             response = requests.post(
                 self.url,
                 json=data,
+                headers=headers,
                 timeout=(self.timeout_connect, self.timeout_read)
             )
             response.raise_for_status()
 
-            logger.info(f"✅ OCR request successful (status: {response.status_code})")
-
             ocr_result = response.json()
-            logger.info(f"📄 OCR result received")
-
-            # 记录结果摘要
-            if isinstance(ocr_result, dict):
-                if 'data' in ocr_result:
-                    logger.info(f"  Data keys: {list(ocr_result.get('data', {}).keys())}")
-                if 'text' in ocr_result:
-                    text_preview = str(ocr_result['text'])[:200]
-                    logger.info(f"  Text preview: {text_preview}...")
-
-            log_dict(logger, ocr_result, "Full OCR result", level=10)  # DEBUG level
+            if not isinstance(ocr_result, dict):
+                raise ValueError("OCR响应必须是JSON对象")
+            logger.info("OCR response received; business result will be validated by parser")
 
             return ocr_result
 
-        except requests.exceptions.Timeout:
+        except requests.exceptions.Timeout as e:
             logger.error(f"❌ OCR request timeout (connect:{self.timeout_connect}s, read:{self.timeout_read}s)")
-            raise RuntimeError(f"OCR请求超时（连接:{self.timeout_connect}s, 读取:{self.timeout_read}s）")
+            raise TimeoutError("OCR请求超时，尚不能确定远端任务是否停止") from e
         except requests.exceptions.RequestException as e:
-            logger.error(f"❌ OCR request failed: {str(e)}")
-            raise RuntimeError(f"OCR请求失败: {str(e)}")
+            logger.error("OCR request transport failed")
+            raise RuntimeError("OCR网络请求失败") from e
         except ValueError as e:
-            logger.error(f"❌ OCR response parse error: {str(e)}")
-            raise RuntimeError(f"OCR返回数据解析失败: {str(e)}")
+            logger.error("OCR response format invalid")
+            raise RuntimeError("OCR返回数据解析失败") from e
 
     def process_image(self, image_url: str) -> dict:
         """
@@ -172,7 +170,7 @@ class OSSAdapter:
             return url
 
         except Exception as e:
-            raise RuntimeError(f"OSS上传失败: {str(e)}")
+            raise RuntimeError("OSS上传或URL签名失败") from e
 
     def generate_presigned_url(self, object_name: str, expires: int = 1800) -> str:
         """
@@ -191,7 +189,7 @@ class OSSAdapter:
             url = bucket.sign_url('GET', object_name, expires)
             return url
         except Exception as e:
-            raise RuntimeError(f"生成签名URL失败: {str(e)}")
+            raise RuntimeError("生成签名URL失败") from e
 
     def delete_file(self, object_name: str):
         """
@@ -205,7 +203,7 @@ class OSSAdapter:
         try:
             bucket.delete_object(object_name)
         except Exception as e:
-            raise RuntimeError(f"删除OSS文件失败: {str(e)}")
+            raise RuntimeError("删除OSS文件失败") from e
 
     def upload_and_get_url(self, local_path: str, prefix: str = "uploads/") -> str:
         """
@@ -219,5 +217,5 @@ class OSSAdapter:
             临时访问URL
         """
         file_path = Path(local_path)
-        object_name = f"{prefix}{file_path.name}"
+        object_name = f"{prefix}{uuid.uuid4().hex}/{file_path.name}"
         return self.upload_file(local_path, object_name)

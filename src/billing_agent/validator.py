@@ -18,6 +18,122 @@ from .models import (
 )
 
 
+def evidence_exists(evidence, source_documents):
+    """Verify a quote within its declared immutable source/block."""
+    squash = lambda value: " ".join(str(value or "").split())
+    if not evidence.original_text.strip():
+        return False
+    for source in source_documents:
+        if evidence.source_id and evidence.source_id != source.get("source_id"):
+            continue
+        if not evidence.source_id and evidence.source_file != source.get("source_file"):
+            continue
+        if evidence.block_id:
+            texts = [b.get("text", "") for b in source.get("blocks", [])
+                     if b.get("block_id") == evidence.block_id
+                     and b.get("source_id", source.get("source_id")) == source.get("source_id")]
+        else:
+            texts = [source.get("content", "")]
+        if any(squash(evidence.original_text) in squash(text) for text in texts):
+            return True
+    return False
+
+
+def validate_extracted_charge(decision, sources, human_review=False, approved_charge_dictionary=None):
+    issues = []
+    charge = decision.charge_details
+    if not charge.original_name.strip():
+        issues.append("费用名称缺失")
+    if not charge.amount.is_finite():
+        issues.append("金额必须为有限十进制数")
+    elif charge.amount.adjusted() >= 16 or charge.amount.normalize().as_tuple().exponent < -8:
+        issues.append("金额超出当前数据库24位总精度/8位小数，不能静默舍入")
+    if not charge.currency or not Validator._is_valid_currency(charge.currency):
+        issues.append("币种未知或无效")
+    if getattr(charge, "amount_role", "line_amount") != "line_amount":
+        issues.append("费用金额必须为明细金额，不能使用总额/余额/条件费率")
+    if decision.financial_attributes.posting_type not in ("AR", "AP"):
+        issues.append("AR/AP交易方向待确认")
+    if not charge.standardized_name:
+        issues.append("标准费用映射待确认")
+    elif not human_review:
+        dictionary = CHARGE_NAME_MAPPING if approved_charge_dictionary is None else approved_charge_dictionary
+        expected_code = dictionary.get(" ".join(charge.original_name.lower().split()))
+        if expected_code != charge.standardized_name:
+            issues.append("费用名称未通过适用字典确认，需人工确认映射")
+    if not human_review:
+        source_ids = {e.source_id for e in decision.evidence if e.source_id}
+        source_names = {e.source_file for e in decision.evidence}
+        related_text = "\n".join(s.get("content", "") for s in sources
+            if s.get("source_id") in source_ids or (not source_ids and s.get("source_file") in source_names))
+        squash = lambda value: " ".join(str(value or "").upper().split())
+        for label, value in (("单据编号", decision.document_info.document_number),
+                             ("签发方", decision.transaction_party.issuer)):
+            if value and squash(value) not in squash(related_text):
+                issues.append(f"{label}缺少对应来源事实")
+        if charge.currency:
+            explicit_code = re.search(r"(?<![A-Z])" + re.escape(charge.currency) + r"(?![A-Z])", related_text.upper())
+            words = {"USD": "美元", "CNY": "人民币", "EUR": "欧元"}
+            if not explicit_code and not (words.get(charge.currency) and words[charge.currency] in related_text):
+                issues.append("币种缺少明确原文依据；单独货币符号不能证明币种")
+        if not decision.evidence or not all(evidence_exists(e, sources) for e in decision.evidence):
+            issues.append("字段证据缺失或无法在指定来源定位")
+        else:
+            # Presence is necessary, not proof of semantic correctness; retain the full quote for review.
+            number_found = False
+            for evidence in decision.evidence:
+                monetary_field = evidence.field_name in ("amount", "line_amount", "charge_details.amount")
+                row_context = (charge.original_name.casefold() in evidence.original_text.casefold()
+                               or (charge.currency and charge.currency in evidence.original_text))
+                if not monetary_field and not row_context:
+                    continue
+                for token in re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?", evidence.original_text.replace("−", "-")):
+                    try:
+                        number_found |= Decimal(token.replace(",", "")) == charge.amount
+                    except InvalidOperation:
+                        pass
+            if not number_found:
+                issues.append("金额缺少对应数值原文证据")
+    if charge.quantity is not None and charge.unit_price is not None:
+        calculated = charge.quantity * charge.unit_price
+        if calculated != charge.amount:
+            issues.append("数量与单价计算不一致；需要明确计价或抵扣规则")
+    if charge.line_items:
+        if any(i.currency != charge.currency for i in charge.line_items):
+            issues.append("禁止跨币种直接合计")
+        elif sum((i.amount for i in charge.line_items), Decimal("0")) != charge.amount:
+            issues.append("明细合计与声明金额不一致")
+    if (getattr(charge, "settlement_amount", None) is None) != (getattr(charge, "settlement_currency", None) is None):
+        issues.append("结算金额和结算币种必须同时提供")
+    if charge.exchange_rate is not None and (not charge.exchange_rate.is_finite() or charge.exchange_rate <= 0):
+        issues.append("汇率必须为原文明示的正有限数")
+    return issues
+
+
+def validate_document_totals(decisions):
+    groups = {}
+    for decision in decisions:
+        doc = decision.document_info
+        source_ids = tuple(sorted({e.source_id or e.source_file for e in decision.evidence}))
+        key = (doc.document_number, decision.transaction_party.issuer, source_ids)
+        groups.setdefault(key, []).append(decision)
+    errors = []
+    for group in groups.values():
+        totals = {d.document_info.document_total for d in group if d.document_info.document_total is not None}
+        if not totals:
+            continue
+        currencies = {d.document_info.total_currency for d in group if d.document_info.document_total is not None}
+        if len(totals) != 1 or len(currencies) != 1 or None in currencies:
+            errors.append("单据总额或总额币种存在冲突")
+            continue
+        currency = next(iter(currencies))
+        if any(d.charge_details.currency != currency for d in group):
+            errors.append("单据总额不能与不同币种的费用直接相加核对")
+        elif sum((d.charge_details.amount for d in group), Decimal("0")) != next(iter(totals)):
+            errors.append("单据费用合计与原文总额不一致")
+    return errors
+
+
 class Validator:
     """验证器：对模型决策进行程序验证"""
 
@@ -309,6 +425,9 @@ CHARGE_NAME_MAPPING = {
     "handling charge": "HANDLING_CHARGE",
     "handling": "HANDLING_CHARGE",
     "操作费": "HANDLING_CHARGE",
+    "4 add'l detention free time charge": "DETENTION_FREE_TIME_CHARGE",
+    "wharfage": "WHARFAGE",
+    "wharfage administration fee": "WHARFAGE_ADMINISTRATION_FEE",
 
     "documentation fee": "DOCUMENTATION_FEE",
     "doc fee": "DOCUMENTATION_FEE",
