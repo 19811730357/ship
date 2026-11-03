@@ -39,7 +39,8 @@ def evidence_exists(evidence, source_documents):
     return False
 
 
-def validate_extracted_charge(decision, sources, human_review=False, approved_charge_dictionary=None):
+def validate_extracted_charge(decision, sources, human_review=False, approved_charge_dictionary=None,
+                              allow_unmapped_charges=False):
     issues = []
     charge = decision.charge_details
     if not charge.original_name.strip():
@@ -54,9 +55,9 @@ def validate_extracted_charge(decision, sources, human_review=False, approved_ch
         issues.append("费用金额必须为明细金额，不能使用总额/余额/条件费率")
     if decision.financial_attributes.posting_type not in ("AR", "AP"):
         issues.append("AR/AP交易方向待确认")
-    if not charge.standardized_name:
+    if not charge.standardized_name and not allow_unmapped_charges:
         issues.append("标准费用映射待确认")
-    elif not human_review:
+    elif charge.standardized_name and not human_review:
         dictionary = CHARGE_NAME_MAPPING if approved_charge_dictionary is None else approved_charge_dictionary
         expected_code = dictionary.get(" ".join(charge.original_name.lower().split()))
         if expected_code != charge.standardized_name:
@@ -81,11 +82,16 @@ def validate_extracted_charge(decision, sources, human_review=False, approved_ch
         else:
             # Presence is necessary, not proof of semantic correctness; retain the full quote for review.
             number_found = False
+            from .source_amounts import line_amount_evidence
             for evidence in decision.evidence:
                 monetary_field = evidence.field_name in ("amount", "line_amount", "charge_details.amount")
                 row_context = (charge.original_name.casefold() in evidence.original_text.casefold()
                                or (charge.currency and charge.currency in evidence.original_text))
                 if not monetary_field and not row_context:
+                    continue
+                if not line_amount_evidence(evidence, decision, sources):
+                    if monetary_field:
+                        issues.append("总额/余额/单价等汇总费率，或无法确定金额列的多数字原文，不能作为明细金额证据")
                     continue
                 for token in re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?", evidence.original_text.replace("−", "-")):
                     try:
@@ -130,7 +136,9 @@ def validate_document_totals(decisions):
         if any(d.charge_details.currency != currency for d in group):
             errors.append("单据总额不能与不同币种的费用直接相加核对")
         elif sum((d.charge_details.amount for d in group), Decimal("0")) != next(iter(totals)):
-            errors.append("单据费用合计与原文总额不一致")
+            calculated = sum((d.charge_details.amount for d in group), Decimal("0"))
+            declared = next(iter(totals))
+            errors.append(f"单据费用合计与原文总额不一致：明细合计 {calculated} {currency}，单据总额 {declared}，差额 {calculated - declared}")
     return errors
 
 

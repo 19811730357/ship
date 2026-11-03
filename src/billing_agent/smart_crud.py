@@ -7,6 +7,7 @@ import uuid
 
 from .database import normalize
 from .models import AuditTrail, Evidence, LedgerRecord
+from .policies import apply_posting_policy, unresolved_model_review
 from .validator import CHARGE_NAME_MAPPING, evidence_exists, validate_extracted_charge
 
 PATCH_FIELDS = {
@@ -18,9 +19,14 @@ PATCH_FIELDS = {
 
 
 class SmartCRUDExecutor:
-    def __init__(self, db, accounting_entity, approved_charge_dictionary=None):
+    def __init__(self, db, accounting_entity, approved_charge_dictionary=None,
+                 default_posting_type=None, allow_unmapped_charges=False):
         self.db = db
         self.accounting_entity = accounting_entity
+        if default_posting_type not in (None, "AR", "AP"):
+            raise ValueError("默认交易方向必须是 AR、AP 或空值")
+        self.default_posting_type = default_posting_type
+        self.allow_unmapped_charges = allow_unmapped_charges
         dictionary = CHARGE_NAME_MAPPING if approved_charge_dictionary is None else approved_charge_dictionary
         self.approved_charge_dictionary = {" ".join(key.lower().split()): value for key, value in dictionary.items()}
 
@@ -46,6 +52,13 @@ class SmartCRUDExecutor:
         return rows
 
     def plan(self, decision, source_documents=None, allow_updates=False, review=None):
+        warnings, resolved = [], []
+        result = self._plan(decision, source_documents, allow_updates, review, warnings, resolved)
+        result["warnings"] = warnings
+        result["resolved_issues"] = resolved
+        return result
+
+    def _plan(self, decision, source_documents, allow_updates, review, warnings, resolved):
         decision = decision.model_copy(deep=True)
         original_candidates = self.candidates_for(decision)
         sources = source_documents or []
@@ -64,18 +77,19 @@ class SmartCRUDExecutor:
                                ("posting_type", decision.financial_attributes)):
                 if review.get(field):
                     setattr(obj, field, review[field])
+            if review.get("posting_type"):
+                decision.financial_attributes.posting_type_origin = "human"
+                decision.financial_attributes.policy_version = None
+                decision.financial_attributes.posting_type_reasoning = "人工复核：" + review["note"]
             decision.evidence.append(Evidence(
                 source_file="human_review", source_type="human_review",
                 original_text=review["note"], field_name="review"))
         if decision.financial_attributes.accounting_entity != self.accounting_entity:
             return self._pending(decision, [], ["记账主体不一致"])
-        issues = validate_extracted_charge(decision, sources, human_review=human,
-                                          approved_charge_dictionary=self.approved_charge_dictionary)
+        issues = []
         rows = self.candidates_for(decision)
         if human:
             rows = list({r.record_id: r for r in original_candidates + rows}.values())
-        if decision.suggested_operation == "PENDING_REVIEW" and not human:
-            issues.append("模型报告待复核：" + decision.operation_reasoning)
         named = [r for r in rows if
                  normalize(r.charge_details.original_name) == normalize(decision.charge_details.original_name)
                  or (decision.charge_details.standardized_name and
@@ -98,20 +112,28 @@ class SmartCRUDExecutor:
                 matched = specific[0]
             else:
                 issues.append("存在多条同名费用，必须提供稳定明细标识或人工选择")
+        warnings.extend(apply_posting_policy(decision.financial_attributes, matched, self.default_posting_type))
+        dictionary = dict(self.approved_charge_dictionary)
         if matched:
-            if not decision.financial_attributes.posting_type:
-                decision.financial_attributes.posting_type = matched.financial_attributes.posting_type
-                decision.financial_attributes.posting_type_reasoning = matched.financial_attributes.posting_type_reasoning
             if not decision.charge_details.standardized_name:
                 decision.charge_details.standardized_name = matched.charge_details.standardized_name
-            dictionary = dict(self.approved_charge_dictionary)
             if (normalize(matched.charge_details.original_name) == normalize(decision.charge_details.original_name)
                 and matched.charge_details.standardized_name):
                 dictionary[" ".join(decision.charge_details.original_name.lower().split())] = matched.charge_details.standardized_name
-            issues = validate_extracted_charge(decision, sources, human_review=human,
-                                              approved_charge_dictionary=dictionary)
-            if decision.suggested_operation == "PENDING_REVIEW" and not human:
-                issues.append("模型报告待复核：" + decision.operation_reasoning)
+        issues.extend(validate_extracted_charge(decision, sources, human_review=human,
+                                               approved_charge_dictionary=dictionary,
+                                               allow_unmapped_charges=self.allow_unmapped_charges))
+        if self.allow_unmapped_charges and not decision.charge_details.standardized_name:
+            warnings.append({"code": "CHARGE_MAPPING_UNKNOWN", "severity": "warning", "origin": "policy",
+                             "message": "费用尚未映射内部标准代码，保留原始名称：" + decision.charge_details.original_name})
+        if not human:
+            code = decision.charge_details.standardized_name
+            approved = dictionary.get(" ".join(decision.charge_details.original_name.lower().split()))
+            mapping_resolved = bool(code and code == approved) or (not code and self.allow_unmapped_charges)
+            blockers, resolved_by_policy = unresolved_model_review(decision, mapping_resolved)
+            issues.extend(blockers)
+            resolved.extend(resolved_by_policy)
+        if matched:
             old_doc, new_doc = matched.document_info, decision.document_info
             if not human:
                 if (decision.charge_details.line_reference and matched.charge_details.line_reference
@@ -203,6 +225,8 @@ class SmartCRUDExecutor:
                     if review.get(field):
                         setattr(obj, field, review[field])
             after.evidence.extend(decision.evidence)
+            for field in ("posting_type_origin", "posting_type_reasoning", "policy_version"):
+                setattr(after.financial_attributes, field, getattr(decision.financial_attributes, field))
             after.version += 1
             after.updated_at = datetime.now()
             audit = self._audit("UPDATE", decision, before, after.model_dump(mode="json"), patch, review)

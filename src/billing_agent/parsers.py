@@ -1,5 +1,5 @@
 """Parse documents into attributable text blocks, including email children."""
-from .runtime import configure_runtime, SOURCE_DIR
+from .runtime import configure_runtime, SOURCE_DIR, ROOT_DIR
 configure_runtime()
 
 import hashlib
@@ -9,6 +9,9 @@ import json
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import uuid
 from email import policy
 from email.parser import BytesParser
@@ -52,16 +55,22 @@ class _HTMLText(HTMLParser):
 
 
 def _safe_name(name):
-    base = PureWindowsPath(str(name).replace("/", "\\")).name
-    base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", base).strip(" .")
-    return base[:180] or "attachment.bin"
+    """Use an ASCII cloud filename; keep the original name in source metadata."""
+    suffix = PureWindowsPath(str(name).replace("/", "\\")).suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+        suffix = ".bin"
+    # The caller's UUID directory provides uniqueness. Percent-encoded original
+    # names can download correctly yet produce an empty company OCR response.
+    return f"document{suffix}"
 
 
 def _attachment_parts(message):
     """Include inline assets without traversing an attached message twice."""
     for part in message.iter_parts() if message.is_multipart() else ():
         if (part.get_content_type() == "message/rfc822" or part.get_filename()
-                or part.get_content_disposition() == "attachment"):
+                or part.get_content_disposition() == "attachment"
+                or (part.get_content_maintype() == "image" and
+                    (part.get_content_disposition() == "inline" or part.get("Content-ID")))):
             yield part
         elif part.is_multipart():
             yield from _attachment_parts(part)
@@ -73,8 +82,24 @@ class DocumentParser:
     MAX_EMAIL_BYTES = 100 * 1024 * 1024
     MAX_DEPTH = 4
 
-    def __init__(self, ocr_enabled=False, ocr_adapter=None, oss_adapter=None, work_dir=None):
+    def __init__(self, ocr_enabled=False, ocr_adapter=None, oss_adapter=None, work_dir=None,
+                 ocr_backend=None, vision_adapter=None, non_billing_assets=None):
         self.ocr_enabled, self.ocr_adapter, self.oss_adapter = ocr_enabled, ocr_adapter, oss_adapter
+        # Explicit legacy adapters retain their URL/OSS protocol unless a backend is selected.
+        self.ocr_backend = ocr_backend or ("vision" if vision_adapter is not None else "remote")
+        if self.ocr_backend not in ("vision", "remote"):
+            raise ValueError("OCR_BACKEND 仅支持 vision 或 remote")
+        self.vision_adapter = vision_adapter
+        if non_billing_assets is None:
+            catalog = ROOT_DIR / "config" / "non_billing_assets.json"
+            non_billing_assets = json.loads(catalog.read_text(encoding="utf-8")) if catalog.is_file() else {}
+        if not isinstance(non_billing_assets, dict):
+            raise ValueError("已核验的非账单素材清单必须为摘要到核验记录的对象")
+        self.non_billing_assets = {digest: review for digest, review in non_billing_assets.items()
+            if re.fullmatch(r"[a-f0-9]{64}", str(digest)) and isinstance(review, dict)
+            and review.get("approved") is True and review.get("scope") == "email_attachment"
+            and isinstance(review.get("reason"), str) and review["reason"].strip()
+            and isinstance(review.get("reviewed_by"), str) and review["reviewed_by"].strip()}
         self.work_dir = Path(work_dir).resolve() if work_dir else SOURCE_DIR
         if self.work_dir.drive and self.work_dir.drive.upper() != "D:":
             raise ValueError("解析缓存和来源档案必须位于 D 盘")
@@ -119,7 +144,7 @@ class DocumentParser:
             blocks.append(block)
         return blocks
 
-    def _result(self, path, source_type, blocks, metadata=None, attachments=None, errors=None):
+    def _result(self, path, source_type, blocks, metadata=None, attachments=None, errors=None, empty_error=None):
         source_id, archive = self._archive(path)
         result = {"content": "\n".join(block["text"] for block in blocks),
                   "source_id": source_id, "source_file": self._display_name(path),
@@ -128,8 +153,8 @@ class DocumentParser:
                                **(metadata or {})},
                   "attachments": attachments or [], "errors": errors or []}
         self._save_observation(result)
-        if not blocks or not any(block["text"].strip() for block in blocks):
-            raise OCRProcessingError("没有取得可识别文本；文件未被标记为解析成功",
+        if (not blocks or not any(block["text"].strip() for block in blocks)) and not result["metadata"].get("skipped"):
+            raise OCRProcessingError(empty_error or "没有取得可识别文本；文件未被标记为解析成功",
                                      {"source_id": source_id, **result["metadata"], "errors": errors or []})
         return result
 
@@ -208,7 +233,20 @@ class DocumentParser:
         self._depth += 1
         try:
             for index, part in enumerate(_attachment_parts(message), 1):
-                filename = part.get_filename() or f"attachment-{index}{mimetypes.guess_extension(part.get_content_type()) or '.bin'}"
+                # 避免使用 mimetypes.guess_extension（编码问题）
+                content_type = part.get_content_type()
+                ext_map = {
+                    'image/jpeg': '.jpg',
+                    'image/png': '.png',
+                    'image/gif': '.gif',
+                    'application/pdf': '.pdf',
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+                    'application/vnd.ms-excel': '.xls',
+                    'text/plain': '.txt',
+                    'text/html': '.html',
+                }
+                ext = ext_map.get(content_type, '.bin')
+                filename = part.get_filename() or f"attachment-{index}{ext}"
                 if part.get_content_type() == "message/rfc822":
                     payload = part.get_payload()
                     raw = payload[0].as_bytes() if isinstance(payload, list) and payload else b""
@@ -230,8 +268,19 @@ class DocumentParser:
                     child_path.parent.mkdir(parents=True, exist_ok=True)
                     if not child_path.exists():
                         child_path.write_bytes(raw)
-                    parsed = self.parse_file(child_path)
-                    entry.update(status="success" if not parsed["errors"] else "partial", parsed=parsed)
+                    review = self.non_billing_assets.get(child_id)
+                    if review and part.get_content_maintype() == "image":
+                        parsed = self._result(child_path, "image", [], {
+                            "skipped": True, "content_kind": "reviewed_non_billing_asset",
+                            "skip_reason": review["reason"], "asset_review": review}, errors=[{
+                                "code": "reviewed_non_billing_asset", "severity": "warning",
+                                "source_id": child_id, "message": "已跳过按文件摘要核验的无关邮件素材",
+                                "reason": review["reason"]}])
+                    else:
+                        parsed = self.parse_file(child_path)
+                    status = "skipped" if parsed["metadata"].get("skipped") else (
+                        "partial" if any(issue.get("severity") != "warning" for issue in parsed["errors"]) else "success")
+                    entry.update(status=status, parsed=parsed)
                     blocks.extend({**block, "parent_source_id": block.get("parent_source_id", source_id)}
                                   for block in parsed["blocks"])
                     errors.extend(parsed["errors"])
@@ -259,7 +308,7 @@ class DocumentParser:
             if len(text.strip()) >= 20:
                 blocks.extend(self._blocks(source_id, text, page=page_number, prefix=f"page-{page_number}"))
                 continue
-            if not self.ocr_enabled or not self.ocr_adapter:
+            if not self.ocr_enabled or (self.ocr_backend == "remote" and not self.ocr_adapter):
                 errors.append({"code": "page_requires_ocr", "source_id": source_id,
                                "page": page_number, "error": "PDF页面文本不足，需要OCR"})
                 if text.strip():
@@ -274,7 +323,7 @@ class DocumentParser:
             try:
                 recognized, metadata, page_errors = self._ocr_local(page_path)
                 raw_ocr.append({"page": page_number, **metadata})
-                errors.extend(page_errors)
+                errors.extend({**issue, "source_id": source_id, "page": page_number} for issue in page_errors)
                 blocks.extend(self._blocks(source_id, recognized, page=page_number, prefix=f"page-{page_number}-ocr"))
             except OCRProcessingError as exc:
                 errors.append({"code": "page_ocr_failed", "source_id": source_id,
@@ -293,29 +342,40 @@ class DocumentParser:
         return {**event, "cleanup_record": str(path)}
 
     def _ocr_local(self, path):
+        if self.ocr_backend == "vision":
+            return self._vision_local(path)
         if not self.ocr_enabled or not self.ocr_adapter:
             raise OCRProcessingError("OCR未启用，不能识别此材料")
         if self.oss_adapter is None:
             from .integrations import OSSAdapter
             self.oss_adapter = OSSAdapter()
         if not self.oss_adapter.is_configured():
-            raise OCRProcessingError("本地OCR需要配置OSS，原文件已保留，可配置后重试")
+            raise OCRProcessingError(
+                "公司OCR接口的file参数需要可访问的图片/PDF URL；当前本地文件缺少上传或链接获取方式。"
+                "这不需要视觉模型，也不能仅凭示例假定支持Base64或文件直传；原文件已保留。",
+                {"code": "OCR_FILE_URL_REQUIRED", "ocr_backend": "remote", "required_input": "file_url",
+                 "category": "configuration", "needs_vision_model": False,
+                 "message": "请由题方确认可访问文件链接或配套上传协议；OSS只是已有的可选URL桥接方式"})
         object_name = f"billing-ocr/{uuid.uuid4().hex}/{_safe_name(Path(path).name)}"
         metadata, errors = {}, []
         try:
             url = self.oss_adapter.upload_file(str(path), object_name)
-        except Exception:
-            try:
-                self.oss_adapter.delete_file(object_name)
-            except Exception:
-                metadata.update(self._pending_cleanup(object_name, "上传或签名失败，清理未完成"))
-            raise OCRProcessingError("OCR素材上传失败", metadata)
+        except Exception as exc:
+            metadata.update(getattr(exc, "metadata", {}))
+            if metadata.get("object_created") is not False:
+                try:
+                    self.oss_adapter.delete_file(object_name)
+                except Exception:
+                    metadata.update(self._pending_cleanup(object_name, "上传或签名失败，清理未完成"))
+            detail = str(exc) if getattr(exc, "metadata", None) else "OCR素材上传失败"
+            raise OCRProcessingError(detail, metadata) from None
         try:
             raw = self.ocr_adapter.process_file(url, task="orderChange")
         except Exception:
             metadata.update(self._pending_cleanup(object_name, "OCR请求未获得终态，不能确定服务是否仍在读取"))
             raise OCRProcessingError("OCR请求失败或超时，云端对象保留待核实清理", metadata)
         metadata["ocr_raw"] = raw
+        metadata["ocr_content_type"] = "company_structured_fields" if self._is_company_response(raw) else "text"
         if isinstance(raw, dict) and str(raw.get("status", "")).lower() in ("pending", "running", "processing", "queued"):
             metadata.update(self._pending_cleanup(object_name, "OCR任务仍在处理中"))
             raise OCRProcessingError("OCR尚未完成，云端对象保留待清理", metadata)
@@ -323,6 +383,9 @@ class DocumentParser:
             self._validate_ocr_result(raw)
             text = self._extract_ocr_text(raw)
             if not text.strip():
+                metadata.update(code="OCR_EMPTY_RESULT", category="recognition")
+                if self._is_company_response(raw):
+                    raise ValueError("公司OCR返回结果为空，未提供可识别字段或费用；原始响应已保存")
                 raise ValueError("OCR未返回可识别文本")
         except Exception as exc:
             try:
@@ -338,6 +401,58 @@ class DocumentParser:
         metadata["ocr_processed"] = True
         return text, metadata, errors
 
+    def _vision_local(self, path):
+        if not self.ocr_enabled:
+            raise OCRProcessingError("视觉OCR未启用，不能识别此材料")
+        if self.vision_adapter is None:
+            from .integrations import VisionOCRAdapter
+            self.vision_adapter = VisionOCRAdapter()
+        if not self.vision_adapter.is_configured():
+            raise OCRProcessingError("视觉识别未配置，请设置 VISION_MODEL、服务地址和 API 密钥")
+        try:
+            if Path(path).suffix.lower() == ".pdf":
+                renderer = shutil.which(os.getenv("PDFTOPPM_PATH") or "pdftoppm")
+                if not renderer:
+                    raise ValueError("扫描PDF需要Poppler pdftoppm，请配置 PDFTOPPM_PATH")
+                render_dir = self.work_dir / "ocr-pages"
+                render_dir.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(dir=render_dir) as folder:
+                    prefix = Path(folder) / "page"
+                    command = [renderer, "-f", "1", "-l", "1", "-singlefile", "-scale-to", "2400",
+                               "-png", str(path), str(prefix)]
+                    subprocess.run(command, check=True, capture_output=True, timeout=60,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                    result = self.vision_adapter.process_local_file(prefix.with_suffix(".png"))
+            else:
+                result = self.vision_adapter.process_local_file(path)
+        except Exception as exc:
+            if isinstance(exc, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+                raise OCRProcessingError("Poppler pdftoppm渲染失败或超时") from None
+            metadata = {"ocr_backend": "vision", "ocr_provider": "vision", **getattr(exc, "metadata", {})}
+            raise OCRProcessingError("视觉识别失败：" + str(exc), metadata) from None
+        if not isinstance(result, dict) or not isinstance(result.get("text"), str):
+            raise OCRProcessingError("视觉识别未返回有效文本")
+        text = result["text"]
+        metadata = {"ocr_processed": True, "ocr_backend": "vision",
+                    "ocr_provider": result.get("provider", "vision"), "ocr_model": result.get("model"),
+                    "ocr_raw": result.get("raw", {}), "content_kind": result.get("content_kind", "unknown")}
+        if metadata["content_kind"] == "decorative":
+            reason = result.get("skip_reason")
+            billing_text = re.search(
+                r"\b(?:INVOICE|DEBIT|CREDIT|AMOUNT|TOTAL|CHARGES?|FEES?|RATE|FREIGHT|HANDLING|"
+                r"DETENTION|DEMURRAGE|STORAGE|TARIFF|USD|CNY|RMB|EUR|GBP|JPY|CAD|AUD|CHF|HKD|SGD|"
+                r"PAYMENT|PAYABLE|DUE|BALANCE)\b|账单|费用|金额|应付|应收|运费|付款|收款|人民币|"
+                r"[￥$€]|\d+[.,]\d{2}|\d[\d,]*(?:\.\d+)?\s*[元圆块]", text, re.I)
+            if not isinstance(reason, str) or not reason.strip() or billing_text:
+                raise OCRProcessingError("装饰图片判定缺少依据或与账单文字冲突", metadata)
+            metadata.update(skipped=True, skip_reason=reason.strip())
+            warning = {"code": "decorative_content_skipped", "severity": "warning",
+                       "error": "已跳过明确无关的装饰素材", "reason": reason.strip()}
+            return "", metadata, [warning]
+        if not text.strip():
+            raise OCRProcessingError("视觉识别未返回可识别文本", metadata)
+        return text, metadata, []
+
     @staticmethod
     def _validate_ocr_result(result):
         if not isinstance(result, dict):
@@ -350,6 +465,8 @@ class DocumentParser:
             raise ValueError("OCR尚未处理完成")
 
     def _extract_ocr_text(self, result):
+        if self._is_company_response(result):
+            return self._company_response_text(result["data"]["list"])
         keys = ("text", "markdown", "content", "lines", "blocks", "pages", "data", "result", "results", "words_result", "cells")
         def walk(value):
             if isinstance(value, str):
@@ -364,13 +481,62 @@ class DocumentParser:
             return []
         return "\n".join(walk(result))
 
+    @staticmethod
+    def _is_company_response(result):
+        return (isinstance(result, dict) and isinstance(result.get("data"), dict)
+                and isinstance(result["data"].get("list"), list))
+
+    @staticmethod
+    def _company_response_text(records):
+        """Expose observed business fields without calling them verbatim image text."""
+        def present(value):
+            if isinstance(value, dict):
+                return any(present(item) for item in value.values())
+            if isinstance(value, list):
+                return any(present(item) for item in value)
+            return value is not None and value != ""
+
+        def cell(value):
+            return json.dumps(value, ensure_ascii=False, default=str).replace("|", "\\u007c")
+
+        lines = []
+        administrative = {"chargeList", "page_index", "fileType", "suspicious", "isDetention", "isDemurrage"}
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                raise ValueError("公司OCR data.list条目必须为对象")
+            charges = record.get("chargeList") or []
+            if not isinstance(charges, list) or any(not isinstance(charge, dict) for charge in charges):
+                raise ValueError("公司OCR chargeList必须为费用对象数组")
+            facts = [(key, value) for key, value in record.items() if key not in administrative and present(value)]
+            actual_charges = [charge for charge in charges if any(present(v) for v in charge.values())]
+            if not facts and not actual_charges:
+                continue
+            lines.append(f"公司OCR结构化观察 data.list[{index}]（接口提取字段，非图片逐字转录）")
+            for key, value in facts:
+                lines.append(f"data.list[{index}].{key}: {cell(value)}")
+            if actual_charges:
+                lines.append(f"data.list[{index}].chargeList:")
+                lines.append("| chargeItem | amount | currency | chargeCtr |")
+                lines.append("| --- | --- | --- | --- |")
+                for charge in actual_charges:
+                    lines.append("| " + " | ".join(cell(charge.get(key)) for key in
+                        ("chargeItem", "amount", "currency", "chargeCtr")) + " |")
+        return "\n".join(lines)
+
     def parse_image(self, file_path):
         path = Path(file_path)
         source_id, _ = self._archive(path)
         with Image.open(path) as image:
             metadata = {"format": image.format, "size": image.size, "mode": image.mode}
             image.verify()
-        text, ocr_metadata, errors = self._ocr_local(path)
+        try:
+            text, ocr_metadata, errors = self._ocr_local(path)
+        except OCRProcessingError as exc:
+            errors = [{"code": "image_ocr_failed", "severity": "error", "source_id": source_id,
+                       "error": str(exc), "metadata": exc.metadata}]
+            return self._result(path, "image", [], {**metadata, **exc.metadata}, errors=errors,
+                                empty_error=str(exc))
+        errors = [{**issue, "source_id": source_id} for issue in errors]
         return self._result(path, "image", self._blocks(source_id, text, page=1, prefix="image-ocr"),
                             {**metadata, **ocr_metadata}, errors=errors)
 
@@ -385,7 +551,8 @@ class DocumentParser:
         source_id = "url-" + hashlib.sha256(file_url.encode()).hexdigest()
         result = {"content": text, "source_id": source_id, "source_file": "remote-document",
                   "source_type": file_type, "blocks": self._blocks(source_id, text, prefix="remote-ocr"),
-                  "metadata": {"ocr_raw": raw, "ocr_processed": True, "source_identity": "url_observation"},
+                  "metadata": {"ocr_raw": raw, "ocr_processed": True, "source_identity": "url_observation",
+                               "ocr_content_type": "company_structured_fields" if self._is_company_response(raw) else "text"},
                   "attachments": [], "errors": []}
         self._save_observation(result)
         return result

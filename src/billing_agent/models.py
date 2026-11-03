@@ -67,9 +67,22 @@ class LineItem(BaseModel):
     def validate_decimal(cls, v):
         if v is None:
             return None
-        if isinstance(v, (int, float, str)):
+        if isinstance(v, (int, float)):
             return Decimal(str(v))
-        return v
+        if isinstance(v, str):
+            # 清理字符串：移除逗号、空格等
+            v = v.strip().replace(',', '').replace(' ', '')
+            if not v:
+                return None
+            try:
+                return Decimal(v)
+            except Exception as e:
+                print(f"⚠️ Warning: 无法转换金额 '{v}' 为 Decimal: {e}")
+                return None
+        if isinstance(v, Decimal):
+            return v
+        print(f"⚠️ Warning: 未知的金额类型 {type(v)}: {v}")
+        return None
 
 
 class ChargeDetails(BaseModel):
@@ -98,9 +111,22 @@ class ChargeDetails(BaseModel):
     def validate_decimal(cls, v):
         if v is None:
             return None
-        if isinstance(v, (int, float, str)):
+        if isinstance(v, (int, float)):
             return Decimal(str(v))
-        return v
+        if isinstance(v, str):
+            # 清理字符串：移除逗号、空格等
+            v = v.strip().replace(',', '').replace(' ', '')
+            if not v:
+                return None
+            try:
+                return Decimal(v)
+            except Exception as e:
+                print(f"⚠️ Warning: ChargeDetails 无法转换金额 '{v}' 为 Decimal: {e}")
+                return None
+        if isinstance(v, Decimal):
+            return v
+        print(f"⚠️ Warning: ChargeDetails 未知的金额类型 {type(v)}: {v}")
+        return None
 
 
 class FinancialAttributes(BaseModel):
@@ -108,6 +134,8 @@ class FinancialAttributes(BaseModel):
     accounting_entity: str = Field(description="记账主体")
     posting_type: Optional[Literal["AR", "AP"]] = Field(None, description="应收或应付")
     posting_type_reasoning: Optional[str] = Field(None, description="判断依据")
+    posting_type_origin: Optional[Literal["explicit", "model_inferred", "inherited", "default", "human"]] = None
+    policy_version: Optional[str] = Field(None, description="应用方向规则的版本；旧记录可为空")
 
 
 # ============================================
@@ -143,6 +171,7 @@ class AgentDecision(BaseModel):
         None,
         description="UPDATE操作时，说明哪些字段需要修改"
     )
+    review_issues: List[Dict[str, Any]] = Field(default_factory=list, description="模型报告的结构化复核原因")
 
 
 class ExcludedItem(BaseModel):

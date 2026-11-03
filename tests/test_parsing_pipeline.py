@@ -112,6 +112,18 @@ def test_same_filename_uses_distinct_cloud_objects(work):
     assert len(set(oss.uploaded)) == 2
 
 
+@pytest.mark.parametrize("filename", ["001-图片示例.png", "invoice%20(final).PNG"])
+def test_ocr_upload_uses_ascii_name_and_preserves_original_filename(work, filename):
+    oss = FakeOSS()
+    parsed = DocumentParser(True, FakeOCR(), oss, work).parse_file(image_file(work, filename))
+    key = oss.uploaded[0]
+    assert key.isascii() and "%" not in key
+    assert Path(key).suffix == ".png"
+    assert parsed["source_file"] == filename
+    assert parsed["metadata"]["original_filename"] == filename
+    assert oss.deleted == [key]
+
+
 def test_image_without_ocr_fails_instead_of_returning_placeholder(work):
     with pytest.raises(ValueError, match="OCR"):
         DocumentParser(work_dir=work).parse_file(image_file(work))

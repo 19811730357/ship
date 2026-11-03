@@ -42,7 +42,25 @@ def safe_json_dumps(obj, **kwargs):
 
 
 def context_fingerprint(accounting_entity, mode, use_database, db_type, db_config):
-    context = [accounting_entity, mode, bool(use_database), db_type, db_config]
+    config_names = (
+        "QWEN_MODEL", "QWEN_BASE_URL", "OCR_BACKEND", "VISION_MODEL", "VISION_BASE_URL",
+        "VISION_CONNECT_TIMEOUT", "VISION_TIMEOUT", "PDFTOPPM_PATH", "OCR_URL", "OCR_TOKEN_HEADER",
+        "OCR_CONNECT_TIMEOUT", "OCR_TIMEOUT", "OSS_ENDPOINT", "OSS_BUCKET", "OSS_CREDENTIALS_FILE",
+        "DEFAULT_POSTING_TYPE", "ALLOW_UNMAPPED_CHARGES",
+    )
+    effective_config = {name: os.getenv(name, "").strip() for name in config_names}
+    credential_digests = {name: hashlib.sha256(os.getenv(name, "").encode("utf-8")).hexdigest()
+                          for name in ("DASHSCOPE_API_KEY", "VISION_API_KEY", "OCR_TOKEN",
+                                       "OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET")}
+    if effective_config["OSS_CREDENTIALS_FILE"]:
+        try:
+            path = Path(effective_config["OSS_CREDENTIALS_FILE"])
+            credential_digests["OSS_CREDENTIALS_FILE"] = (hashlib.sha256(path.read_bytes()).hexdigest()
+                if path.stat().st_size <= 65536 else "invalid-size")
+        except OSError:
+            credential_digests["OSS_CREDENTIALS_FILE"] = "unreadable"
+    context = [accounting_entity, mode, bool(use_database), db_type, db_config,
+               effective_config, credential_digests]
     return hashlib.sha256(json.dumps(context, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -53,11 +71,65 @@ def safe_upload_name(filename, index):
     return f"{index:03d}-{name}"
 
 
+def issue_message(issue):
+    if not isinstance(issue, dict):
+        return str(issue)
+    return str(next((issue[key] for key in ("message", "error", "description", "reason") if issue.get(key)),
+                    "未提供具体说明，请查看运行报告。"))
+
+
+def issue_is_resolved(issue):
+    return isinstance(issue, dict) and bool(
+        issue.get("acknowledged") or issue.get("resolved") or issue.get("resolved_by_policy")
+        or issue.get("status") in {"resolved", "resolved_by_policy", "resolved_by_reextraction",
+                                  "acknowledged", "excluded"})
+
+
+def issue_is_blocking(issue):
+    if not isinstance(issue, dict):
+        return True
+    return (not issue_is_resolved(issue) and issue.get("blocking") is not False
+            and str(issue.get("severity", "error")).lower() not in {"warning", "info"})
+
+
+def recognition_settings(environ=None):
+    """Return public configuration state, never credential values."""
+    values = os.environ if environ is None else environ
+    backend = str(values.get("OCR_BACKEND", "remote")).strip().lower()
+    if backend == "vision":
+        missing = []
+        if not (str(values.get("VISION_BASE_URL", "")).strip()
+                or str(values.get("QWEN_BASE_URL", "")).strip()):
+            missing.append("VISION_BASE_URL（或 QWEN_BASE_URL）")
+        if not str(values.get("VISION_MODEL", "")).strip():
+            missing.append("VISION_MODEL")
+        if not (str(values.get("VISION_API_KEY", "")).strip()
+                or str(values.get("DASHSCOPE_API_KEY", "")).strip()):
+            missing.append("VISION_API_KEY（或 DASHSCOPE_API_KEY）")
+        return {"backend": backend, "label": "云端视觉识别（无需 OSS）", "requires_oss": False,
+                "configured": not missing, "missing": missing, "requires_file_url": False,
+                "local_files_ready": not missing}
+    if backend == "remote":
+        from src.billing_agent.integrations import OSSAdapter
+        missing = [] if str(values.get("OCR_URL", "")).strip() else ["OCR_URL"]
+        storage = OSSAdapter(environ=values)
+        local_upload_configured = storage.is_configured()
+        return {"backend": backend, "label": "公司 OCR（文件 URL 输入）", "requires_oss": False,
+                "configured": not missing, "missing": missing, "requires_file_url": True,
+                "local_files_ready": not missing and local_upload_configured}
+    return {"backend": backend, "label": "未支持的识别后端", "requires_oss": False,
+            "configured": False, "missing": ["OCR_BACKEND（remote 或 vision）"],
+            "requires_file_url": False, "local_files_ready": False}
+
+
 def result_state(result):
     report = result.get("run_report", {})
+    if report.get("processing_status") == "PROCESSING_FAILED":
+        return "partial" if result.get("committed") else "failed"
     pending = result.get("summary", {}).get("operations", {}).get("PENDING_REVIEW", 0)
-    active_errors = [issue for issue in report.get("file_errors", [])
-                     if not isinstance(issue, dict) or not issue.get("acknowledged")]
+    active_errors = [issue for issue in report.get("file_errors", []) if issue_is_blocking(issue)]
+    if report.get("processing_status") == "COMMITTED" and result.get("committed") and not pending and not active_errors:
+        return "committed"
     failed = report.get("files_failed", 0) or active_errors
     if failed and not result.get("processing_results"):
         return "failed"
@@ -113,6 +185,29 @@ def get_workflow(accounting_entity, mode, use_database, db_type, db_config):
     return st.session_state["billing_workflow"]
 
 
+def render_issue(issue, prefix=None):
+    """Keep actionable details while separating warnings and resolved issues."""
+    data = issue if isinstance(issue, dict) else {}
+    source_name = prefix or data.get("file") or data.get("source_file") or data.get("filename")
+    message = issue_message(issue)
+    text = f"{source_name}：{message}" if source_name else message
+    if data.get("acknowledged"):
+        note = data.get("review_note", data.get("human_note", ""))
+        st.caption(f"来源问题已人工确认与本次费用无关：{source_name or '来源材料'}。依据：{note}")
+    elif issue_is_resolved(issue):
+        st.caption(f"已解决：{text}")
+    elif not issue_is_blocking(issue):
+        show = st.info if str(data.get("severity", "")).lower() == "info" else st.warning
+        show(f"提示：{text}")
+    elif data.get("category") in {"business", "validation"}:
+        st.warning(f"待复核：{text}")
+    else:
+        recognition = (data.get("origin") == "parser"
+                       or data.get("category") in {"recognition", "configuration", "system"}
+                       or str(data.get("code", "")).startswith(("VISION_", "OCR_")))
+        st.error(f"{'识别／配置问题' if recognition else '处理问题'}：{text}")
+
+
 def render_source_documents(result):
     with st.expander("原始材料与解析证据", expanded=False):
         sources = result.get("source_documents", [])
@@ -130,8 +225,8 @@ def render_source_documents(result):
                     st.text(block.get("text", ""))
             elif source.get("content"):
                 st.text(source["content"])
-            if source.get("errors"):
-                st.error(safe_json_dumps(source["errors"], ensure_ascii=False))
+            for issue in source.get("errors", []):
+                render_issue(issue, source.get("source_file"))
 
 
 def candidate_label(candidate):
@@ -144,7 +239,7 @@ def candidate_label(candidate):
 def render_results(result):
     state = result_state(result)
     messages = {
-        "failed": (st.error, "本次处理失败，请查看错误信息后重试。"),
+        "failed": (st.error, "本次识别或提取未完成，请查看具体原因并重试。"),
         "preview": (st.info, "预览已生成，账本尚未写入。核对变更和待复核项后提交。"),
         "committed": (st.success, "已通过校验的变更已提交。"),
         "partial": (st.warning, "已提交通过校验的变更；仍有待复核或失败项，请继续处理。"),
@@ -158,15 +253,10 @@ def render_results(result):
         column.metric(name, operations.get(name, 0))
     report = result.get("run_report", {})
     for error in report.get("file_errors", []):
-        if isinstance(error, dict):
-            source_name = error.get("file", error.get("source_file", "处理错误"))
-            if error.get("acknowledged"):
-                note = error.get("review_note", error.get("human_note", ""))
-                st.caption(f"来源问题已人工确认与本次费用无关：{source_name}。依据：{note}")
-            else:
-                st.error(f"{source_name}：{error.get('error', error.get('message', '失败'))}")
-        else:
-            st.error(str(error))
+        render_issue(error)
+    for issue in report.get("warnings", []):
+        render_issue({**issue, "severity": "warning"} if isinstance(issue, dict)
+                     else {"message": str(issue), "severity": "warning"})
     if report.get("files_skipped"):
         st.caption(f"本次跳过已处理文件 {report['files_skipped']} 个。")
     if report.get("excluded_items"):
@@ -187,9 +277,22 @@ def render_results(result):
                          expanded=(index == 0 or item.get("operation") == "PENDING_REVIEW")):
             st.write(f"金额：{charge.get('amount', '未知')} {charge.get('currency') or '币种未知'}")
             st.write(f"单据号：{item.get('document_info', {}).get('document_number') or '未知'}")
+            financial = item.get("financial_attributes", {})
+            if financial.get("posting_type"):
+                origins = {"default": "按主体缺省规则", "inherited": "继承匹配旧账", "explicit": "原文明示",
+                           "inferred": "模型判断", "model": "模型判断", "model_inferred": "模型推断",
+                           "human": "人工核对"}
+                origin = origins.get(financial.get("posting_type_origin"), "提取结果")
+                st.caption(f"交易方向：{financial['posting_type']} · {origin}")
             st.write(item.get("reason", ""))
             if item.get("validation_issues"):
                 st.warning(safe_json_dumps(item["validation_issues"], ensure_ascii=False))
+            for warning in item.get("warnings", []):
+                render_issue({**warning, "severity": "warning"} if isinstance(warning, dict)
+                             else {"message": str(warning), "severity": "warning"})
+            for resolved in item.get("resolved_issues", []):
+                render_issue({**resolved, "status": "resolved"} if isinstance(resolved, dict)
+                             else {"message": str(resolved), "status": "resolved"})
             if item.get("patch"):
                 st.write("拟修改字段")
                 st.table([{"字段": field, "旧值": str(change.get("old")), "新值": str(change.get("new"))}
@@ -211,7 +314,7 @@ def render_results(result):
 def render_commit_form(result, workflow):
     pending = result.get("summary", {}).get("operations", {}).get("PENDING_REVIEW", 0)
     source_issues = result.get("run_report", {}).get("file_errors", [])
-    reviewable_sources = any(isinstance(issue, dict) and issue.get("reviewable") and not issue.get("acknowledged")
+    reviewable_sources = any(isinstance(issue, dict) and issue.get("reviewable") and issue_is_blocking(issue)
                              for issue in source_issues)
     if not result.get("preview_id") or (result.get("committed") and not pending and not reviewable_sources):
         return
@@ -221,10 +324,10 @@ def render_commit_form(result, workflow):
     with st.form(f"commit_form_{preview_id}"):
         st.write("提交与人工复核")
         for issue_index, issue in enumerate(source_issues):
-            if not isinstance(issue, dict) or not issue.get("reviewable") or issue.get("acknowledged"):
+            if not isinstance(issue, dict) or not issue.get("reviewable") or not issue_is_blocking(issue):
                 continue
             source_name = issue.get("file", issue.get("source_file", issue.get("attachment", "来源材料")))
-            st.write(f"来源问题：{source_name} · {issue.get('error', issue.get('message', '解析失败'))}")
+            st.write(f"来源问题：{source_name} · {issue_message(issue)}")
             exclude = st.checkbox("已核对，与本次费用无关", key=f"review_source_exclude_{preview_id}_{issue_index}")
             note = st.text_area("说明与费用无关的依据", key=f"review_source_note_{preview_id}_{issue_index}",
                                 help="仅可排除已核对的无关附件或素材；无法确认时不要勾选。金额、模型提取和单据合计错误仍须解决。")
@@ -302,7 +405,7 @@ def main():
     st.set_page_config(page_title="航运智能账单助手 V2", page_icon="🚢", layout="wide")
     st.title("航运智能账单助手 V2")
     st.caption("逐条提取费用，核对旧账与修改依据，校验后提交。")
-    accounting_entity = st.sidebar.text_input("记账主体", value="Demo Origin", key="accounting_entity").strip()
+    accounting_entity = st.sidebar.text_input("记账主体", value="湃乐多国际物流", key="accounting_entity").strip()
     mode = st.sidebar.radio("运行模式", ["模拟演示", "真实文件处理"], key="processing_mode")
     use_database = st.sidebar.checkbox("启用数据库持久化", value=True, key="use_database")
     db_type, db_config = None, None
@@ -333,8 +436,33 @@ def main():
                     st.error(f"演示失败：{exc}")
     else:
         api_configured = is_api_configured()
-        st.sidebar.caption("模型密钥：已设置" if api_configured else "模型密钥：未设置")
-        st.info("上传 EML、PDF、Excel/CSV、DOCX、TXT 或图片。扫描 PDF 和图片需要配置 OCR 与对象存储。")
+        st.sidebar.caption("文本模型密钥：已设置" if api_configured else "文本模型密钥：未设置")
+        recognition = recognition_settings()
+        st.sidebar.caption(f"图片识别：{recognition['label']}")
+        st.sidebar.caption("识别接口：已设置（尚未验证调用）" if recognition["configured"] else "识别接口：待填写")
+        if recognition["requires_file_url"]:
+            st.sidebar.caption("本地文件 URL 通道：已配置" if recognition["local_files_ready"] else "本地文件 URL 通道：待确认")
+        default_direction = os.getenv("DEFAULT_POSTING_TYPE", "AR").strip().upper()
+        st.sidebar.caption(f"缺省交易方向：{default_direction or '未启用'}（新账缺少方向时适用）")
+        mapping_required = os.getenv("ALLOW_UNMAPPED_CHARGES", "true").strip().lower() in {"0", "false", "no", "off"}
+        st.sidebar.caption("未映射费用：需确认标准代码" if mapping_required else "未映射费用：保留原名并提示")
+        st.info("上传 EML、PDF、Excel/CSV、DOCX、TXT 或图片。邮件正文和文字 PDF 直接读取；图片及扫描页需满足所选 OCR 接口的输入要求。")
+        if recognition["requires_file_url"]:
+            st.caption("公司 OCR 的 file 参数是识别服务可读取的文件 URL；识别接口本身不是上传接口。")
+            if not recognition["configured"]:
+                st.warning("公司 OCR 接口尚未配置：请在项目 .env 中填写 OCR_URL。配置后重启应用；文字材料仍可处理。")
+            elif not recognition["local_files_ready"]:
+                st.warning("公司 OCR 接口已配置，但本地图片／扫描页仍缺少识别服务可读取的文件 URL。"
+                           "目前只有识别请求示例，尚无已确认的上传方式或可用文件 URL；D 盘路径不能代替 URL。"
+                           "EML 正文和文字附件仍可读取，图片附件同样受此限制。"
+                           "请向题方确认文件上传／存储方式或提供真实可达文件 URL。详见 docs/公司OCR配置与输入限制.md。")
+            else:
+                st.caption("已配置可选 OSS 上传通道，可用于取得本地文件 URL；连通性和权限仍需另行验证。")
+        elif recognition["configured"]:
+            st.caption("已显式选择自有云端视觉服务；该可选入口不属于公司 OCR 的必要配置。")
+        else:
+            st.warning("图片／扫描页识别尚未配置：请在项目 .env 中填写 " + "、".join(recognition["missing"])
+                       + "。这是显式选择的可选后端；题方 OCR 主流程使用 OCR_BACKEND=remote。配置后重启应用。")
         uploaded_files = st.file_uploader("材料文件", type=["eml", "pdf", "xlsx", "xls", "csv", "docx", "txt", "png", "jpg", "jpeg"], accept_multiple_files=True)
         ledger_file = st.file_uploader("导入完整旧账快照（可选）", type=["json"])
         force_reprocess = st.checkbox("重新解析已处理文件", value=False, help="重新解析不会授权重复记账或覆盖旧账。")
@@ -358,7 +486,17 @@ def main():
                 st.session_state["billing_result"] = result
             except Exception as exc:
                 st.session_state.pop("billing_result", None)
+                # 显示详细错误信息
+                import traceback
+                error_detail = traceback.format_exc()
                 st.error(f"处理失败：{exc}")
+                with st.expander("查看详细错误信息"):
+                    st.code(error_detail)
+                # 同时打印到终端
+                print("=" * 60)
+                print("处理失败 - 详细错误信息：")
+                print(error_detail)
+                print("=" * 60)
         if not api_configured:
             st.warning("真实提取需要在项目 .env 中配置模型密钥；当前仍可运行离线演示。")
     result = st.session_state.get("billing_result")

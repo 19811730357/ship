@@ -152,9 +152,11 @@ def test_real_pdf2_three_independent_charges_commit_without_total_duplication(wo
         db.close()
 
 
-def test_real_eml_includes_attached_bills_and_reports_unread_inline_image(work):
+def test_real_eml_includes_attached_bills_and_reports_unreviewed_inline_image(work):
     email_path = next(SAMPLES.glob("*.eml"))
-    parser = DocumentParser(work_dir=work)
+    # Disable the reviewed-asset catalog to keep exercising unknown-image
+    # failures: a known banner's review must not hide other parser errors.
+    parser = DocumentParser(work_dir=work, non_billing_assets={})
     parsed = parser.parse_file(email_path)
     pdf_attachments = [a for a in parsed["attachments"] if a["filename"].lower().endswith(".pdf")]
     assert len(pdf_attachments) == 2
@@ -195,3 +197,12 @@ def test_real_eml_includes_attached_bills_and_reports_unread_inline_image(work):
         assert db.check_document_processed(email_path.read_bytes(), SYNTHETIC_ENTITY) is None
     finally:
         db.close()
+
+
+def test_real_eml_skips_only_the_reviewed_banner_and_keeps_attachment_observation(work):
+    parsed = DocumentParser(work_dir=work).parse_file(next(SAMPLES.glob("*.eml")))
+    banner = next(a for a in parsed["attachments"] if a["filename"] == "InsertPic_C25B.jpg")
+    assert banner["status"] == "skipped"
+    assert banner["parsed"]["metadata"]["asset_review"]["scope"] == "email_attachment"
+    assert Path(banner["parsed"]["metadata"]["observation_path"]).is_file()
+    assert not any(error.get("severity") != "warning" for error in parsed["errors"])

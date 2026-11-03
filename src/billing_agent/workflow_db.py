@@ -13,6 +13,7 @@ from .ledger import load_ledger_from_dict
 from .models import AgentDecision, AgentDecisionBatch, Ledger
 from .smart_crud import SmartCRUDExecutor
 from .validator import validate_document_totals
+from .source_amounts import validate_source_totals
 
 
 class _Overlay:
@@ -44,11 +45,18 @@ class _Overlay:
 
 class DatabaseWorkflow:
     def __init__(self, accounting_entity, use_mock_data=True, db_type="sqlite", db_config=None,
-                 db_manager=None, agent=None, parser=None):
+                 db_manager=None, agent=None, parser=None, default_posting_type=None,
+                 allow_unmapped_charges=None):
         if not str(accounting_entity).strip():
             raise ValueError("记账主体不能为空")
         self.accounting_entity = accounting_entity
         self.use_mock_data = use_mock_data
+        self.default_posting_type = (os.getenv("DEFAULT_POSTING_TYPE", "AR") if default_posting_type is None
+                                     else default_posting_type).strip().upper() or None
+        if self.default_posting_type not in (None, "AR", "AP"):
+            raise ValueError("DEFAULT_POSTING_TYPE只能为AR、AP或空值")
+        self.allow_unmapped_charges = (os.getenv("ALLOW_UNMAPPED_CHARGES", "true").lower() in ("true", "1", "yes")
+                                       if allow_unmapped_charges is None else allow_unmapped_charges)
         self.db = db_manager or DatabaseManager(db_type, db_config)
         self.agent, self.parser = agent, parser
         self._previews = {}
@@ -56,17 +64,29 @@ class DatabaseWorkflow:
     def _initialize_services(self):
         if self.parser is None:
             from .parsers import DocumentParser
-            from .integrations import OCRAdapter, OSSAdapter
-            ocr, oss = OCRAdapter(), OSSAdapter()
-            self.parser = DocumentParser(ocr_enabled=ocr.is_configured(), ocr_adapter=ocr, oss_adapter=oss)
+            from .integrations import OCRAdapter, OSSAdapter, VisionOCRAdapter
+            backend = os.getenv("OCR_BACKEND", "remote").strip().lower()
+            if backend == "vision":
+                vision = VisionOCRAdapter()
+                # Keep routing enabled so missing configuration names are reported by the adapter.
+                self.parser = DocumentParser(ocr_enabled=True, ocr_backend="vision", vision_adapter=vision)
+            elif backend == "remote":
+                ocr, oss = OCRAdapter(), OSSAdapter()
+                self.parser = DocumentParser(ocr_enabled=ocr.is_configured(), ocr_backend="remote",
+                                             ocr_adapter=ocr, oss_adapter=oss)
+            else:
+                raise ValueError("OCR_BACKEND只能为vision或remote")
         if self.agent is None:
             from .agent import BillingAgent
-            self.agent = BillingAgent(self.accounting_entity, use_mock=self.use_mock_data)
+            self.agent = BillingAgent(self.accounting_entity, use_mock=self.use_mock_data,
+                                      allow_unmapped_charges=self.allow_unmapped_charges)
 
     @staticmethod
     def _source_views(parsed):
         names, metadata, source_types = {}, {}, {}
         def visit(item):
+            if item.get("metadata", {}).get("skipped"):
+                return
             names[item.get("source_id")] = item.get("source_file")
             metadata[item.get("source_id")] = item.get("metadata", {})
             source_types[item.get("source_id")] = item.get("source_type")
@@ -77,8 +97,10 @@ class DatabaseWorkflow:
         grouped = {}
         for block in parsed.get("blocks", []):
             sid = block.get("source_id", parsed["source_id"])
+            if sid not in names:
+                continue
             grouped.setdefault(sid, []).append(block)
-        if not grouped:
+        if not grouped and not parsed.get("metadata", {}).get("skipped"):
             grouped[parsed["source_id"]] = [{"source_id": parsed["source_id"], "block_id": "content",
                                              "text": parsed.get("content", "")}]
         return [{"source_id": sid, "source_file": names.get(sid, parsed["source_file"]),
@@ -86,6 +108,20 @@ class DatabaseWorkflow:
                  "content": "\n".join(b["text"] for b in blocks),
                  "metadata": metadata.get(sid, {})}
                 for sid, blocks in grouped.items()]
+
+    @staticmethod
+    def _observation_paths(parsed):
+        """Keep all parse observations even when a source is excluded from model input."""
+        paths = []
+        def visit(item):
+            metadata = item.get("metadata", {})
+            path = metadata.get("observation_path") or item.get("observation_path")
+            if path and path not in paths:
+                paths.append(path)
+            for attachment in item.get("attachments", []):
+                visit(attachment.get("parsed") or attachment)
+        visit(parsed)
+        return paths
 
     @staticmethod
     def _combine_parsed_content(sources):
@@ -98,17 +134,22 @@ class DatabaseWorkflow:
         return "\n".join(parts)
 
     @staticmethod
-    def _signature(allow_updates=False, approved_dictionary=None):
+    def _signature(allow_updates=False, approved_dictionary=None, policy=None):
         return hashlib.sha256(json_text({"version": CONFIG_VERSION,
             "model": os.getenv("QWEN_MODEL", "qwen-max"), "base": os.getenv("QWEN_BASE_URL", ""),
             "ocr": os.getenv("OCR_URL", ""), "allow_updates": bool(allow_updates),
+            "ocr_backend": os.getenv("OCR_BACKEND", "remote"), "vision_model": os.getenv("VISION_MODEL", ""),
+            "vision_base": os.getenv("VISION_BASE_URL") or os.getenv("QWEN_BASE_URL", ""),
+            "policy": policy,
             "approved_dictionary": approved_dictionary}).encode()).hexdigest()
 
     def process_real_files(self, file_paths, ledger_data=None, output_dir=None, force_reprocess=False,
                            preview_only=True, allow_updates=False):
         self._initialize_services()
         sources, events, errors, skipped = [], [], [], []
-        signature = self._signature(allow_updates, getattr(self.agent, "approved_charge_dictionary", None))
+        signature = self._signature(allow_updates, getattr(self.agent, "approved_charge_dictionary", None),
+                                    {"default_posting_type": self.default_posting_type,
+                                     "allow_unmapped_charges": self.allow_unmapped_charges})
         seen = set()
         for raw_path in file_paths:
             path = Path(raw_path)
@@ -127,14 +168,14 @@ class DatabaseWorkflow:
                          "results": {"processing_signature": signature}}
                 events.append(event)
                 parsed = self.parser.parse_file(path)
+                event["results"]["observation_paths"] = self._observation_paths(parsed)
                 sources.extend(self._source_views(parsed))
-                event["results"]["observation_paths"] = [view["metadata"]["observation_path"]
-                    for view in self._source_views(parsed) if view["metadata"].get("observation_path")]
                 errors.extend({**issue, "origin": "parser", "reviewable": True}
                               for issue in parsed.get("errors", []))
                 event["source_ids"] = [s["source_id"] for s in self._source_views(parsed)]
             except Exception as exc:
                 errors.append({"file": path.name, "error": str(exc), "origin": "parser", "reviewable": True,
+                               "code": "SOURCE_PROCESSING_FAILED", "category": "processing", "severity": "error",
                                "metadata": getattr(exc, "metadata", {})})
                 if events and events[-1]["file_name"] == path.name:
                     events[-1]["status"] = "failed"
@@ -178,7 +219,11 @@ class DatabaseWorkflow:
                     baseline.append(r)
         repository = _Overlay(self.db, self.accounting_entity, baseline)
         dictionary = getattr(self.agent, "approved_charge_dictionary", None)
-        planner = SmartCRUDExecutor(repository, self.accounting_entity, dictionary)
+        planner = SmartCRUDExecutor(repository, self.accounting_entity, dictionary,
+                                    default_posting_type=self.default_posting_type,
+                                    allow_unmapped_charges=self.allow_unmapped_charges)
+        if self.agent and hasattr(self.agent, "repair_missing_identity"):
+            batch = self.agent.repair_missing_identity(batch, source_documents)
         if allow_updates and self.agent and hasattr(self.agent, "propose_changes"):
             candidates = {r.record_id: r for d in batch.decisions for r in planner.candidates_for(d)}
             if candidates:
@@ -188,12 +233,13 @@ class DatabaseWorkflow:
                 except Exception as exc:
                     batch = batch.model_copy(deep=True)
                     batch.extraction_errors.append({"section": "proposals", "error": str(exc)})
-        blocking = list(errors or []) + [{**error, "origin": "model", "reviewable": False}
-                                          for error in batch.extraction_errors]
+        blocking = deepcopy(list(errors or [])) + [self._model_issue(error) for error in batch.extraction_errors]
         if not batch.decisions and not batch.excluded_items and source_documents:
             blocking.append({"error": "没有识别到费用或明确排除项，不能认定处理成功"})
         plans = [planner.plan(d, source_documents, allow_updates=allow_updates) for d in batch.decisions]
-        totals = self._validate_batch(batch.decisions)
+        blocking = self._resolve_issues(blocking, plans)
+        decisions = [AgentDecision.model_validate(p["decision"]) for p in plans]
+        totals = self._validate_batch(decisions, source_documents)
         self._block_plans(plans, blocking, totals)
         preview_id = str(uuid.uuid4())
         snapshot_versions = {r.record_id: r.version for d in batch.decisions for r in planner.candidates_for(d)}
@@ -204,15 +250,17 @@ class DatabaseWorkflow:
                  "plans": plans, "baseline": baseline, "allow_updates": allow_updates,
                  "output_dir": Path(output_dir) if output_dir else None, "files_processed": files_processed,
                  "files_skipped": files_skipped, "versions": snapshot_versions, "committed_items": set(),
-                 "source_reviews": {}, "approved_dictionary": deepcopy(dictionary)}
+                 "source_reviews": {}, "approved_dictionary": deepcopy(dictionary),
+                 "default_posting_type": self.default_posting_type,
+                 "allow_unmapped_charges": self.allow_unmapped_charges}
         for index, plan in enumerate(plans):
             plan["item_id"] = str(index)
         self._previews[preview_id] = state
         return self._result(preview_id, state, preview=True, committed=False)
 
     @staticmethod
-    def _validate_batch(decisions):
-        issues = validate_document_totals(decisions)
+    def _validate_batch(decisions, source_documents=None):
+        issues = validate_document_totals(decisions) + validate_source_totals(decisions, source_documents or [])
         def anchors(decision):
             result = set()
             for evidence in decision.evidence:
@@ -241,12 +289,59 @@ class DatabaseWorkflow:
 
     @staticmethod
     def _block_plans(plans, errors, totals):
-        issues = [e.get("error", str(e)) if isinstance(e, dict) else str(e) for e in errors] + totals
+        issues = [DatabaseWorkflow._issue_message(e) for e in errors if DatabaseWorkflow._is_blocking(e)] + totals
         if issues:
             for plan in plans:
                 plan["operation"] = "PENDING_REVIEW"
                 plan["validation_issues"] = list(dict.fromkeys(plan["validation_issues"] + issues))
                 plan["reason"] = "；".join(plan["validation_issues"])
+
+    @staticmethod
+    def _issue_message(issue):
+        if not isinstance(issue, dict):
+            return str(issue)
+        return str(issue.get("error") or issue.get("message") or issue.get("description") or issue.get("code") or "未知处理问题")
+
+    @staticmethod
+    def _is_blocking(issue):
+        return not isinstance(issue, dict) or not (
+            issue.get("severity") in ("warning", "info") or issue.get("blocking") is False
+            or issue.get("status") in ("resolved", "resolved_by_policy", "resolved_by_reextraction")
+            or issue.get("acknowledged"))
+
+    def _model_issue(self, error):
+        issue = deepcopy(error) if isinstance(error, dict) else {"error": str(error)}
+        # A model cannot declare an extraction failure resolved or reviewable by itself.
+        issue.update(origin="model", reviewable=False, status="open", blocking=True)
+        safe_warnings = {"CHARGE_MAPPING_UNKNOWN", "EXCLUDED_TYPE_UNKNOWN", "IDENTITY_REPAIR_FAILED"}
+        if issue.get("severity") == "warning" and issue.get("code") in safe_warnings:
+            if issue.get("code") != "CHARGE_MAPPING_UNKNOWN" or self.allow_unmapped_charges:
+                issue["blocking"] = False
+            else:
+                issue["severity"] = "error"
+        else:
+            issue["severity"] = "error"
+        return issue
+
+    def _resolve_issues(self, issues, plans):
+        result = deepcopy(issues)
+        for issue in result:
+            if not isinstance(issue, dict) or issue.get("origin") != "model":
+                continue
+            index = issue.get("item_index")
+            affected = [plans[index]] if type(index) is int and 0 <= index < len(plans) else plans
+            if not affected:
+                continue
+            decisions = [AgentDecision.model_validate(p["decision"]) for p in affected]
+            code = issue.get("code")
+            resolved = code == "POSTING_TYPE_MISSING" and all(d.financial_attributes.posting_type in ("AR", "AP") for d in decisions)
+            resolved |= code == "DOCUMENT_IDENTITY_MISSING" and all(
+                d.document_info.document_number and d.document_info.document_type and d.transaction_party.issuer for d in decisions)
+            if resolved:
+                issue.update(status="resolved_by_policy" if code == "POSTING_TYPE_MISSING" else "resolved_by_reextraction", blocking=False)
+            elif code == "CHARGE_MAPPING_UNKNOWN" and self.allow_unmapped_charges:
+                issue.update(severity="warning", blocking=False)
+        return result
 
     def commit_preview(self, preview_id, review_actions=None):
         if preview_id not in self._previews:
@@ -271,7 +366,9 @@ class DatabaseWorkflow:
             if not current or current.version != version:
                 raise ValueError("候选记录版本已变化，请重新预览")
         planner = SmartCRUDExecutor(_Overlay(self.db, self.accounting_entity, state["baseline"]),
-                                    self.accounting_entity, state["approved_dictionary"])
+                                    self.accounting_entity, state["approved_dictionary"],
+                                    default_posting_type=state["default_posting_type"],
+                                    allow_unmapped_charges=state["allow_unmapped_charges"])
         plans = deepcopy(state["plans"])
         decisions = [AgentDecision.model_validate(p["decision"]) for p in plans]
         for index, old_plan in enumerate(plans):
@@ -286,8 +383,9 @@ class DatabaseWorkflow:
             replacement["review"]["source_reviews"] = list(state["source_reviews"].values())
             plans[index] = replacement
             decisions[index] = AgentDecision.model_validate(replacement["decision"])
-        totals = self._validate_batch(decisions)
-        active_errors = [e for i, e in enumerate(state["errors"]) if i not in state["source_reviews"]]
+        totals = self._validate_batch(decisions, state["sources"])
+        state["errors"] = self._resolve_issues(state["errors"], plans)
+        active_errors = [e for i, e in enumerate(state["errors"]) if i not in state["source_reviews"] and self._is_blocking(e)]
         self._block_plans([p for p in plans if p["item_id"] not in state["committed_items"]], active_errors, totals)
         executable = [p for p in plans if p["operation"] != "PENDING_REVIEW" and p["item_id"] not in state["committed_items"]]
         # Whole-document issues block all associated changes; pending fee identities may be resolved independently.
@@ -331,6 +429,13 @@ class DatabaseWorkflow:
         reported_errors = deepcopy(state["errors"])
         for index, review in state["source_reviews"].items():
             reported_errors[index].update(acknowledged=True, review_note=review["note"])
+        active_errors = [issue for issue in reported_errors if self._is_blocking(issue)]
+        processing_failed = (not rows and bool(active_errors)) or any(
+            isinstance(issue, dict) and (issue.get("origin") == "parser" or issue.get("section") == "model"
+                                        or issue.get("category") in {"processing", "system", "configuration", "recognition", "format"})
+            for issue in active_errors)
+        processing_status = ("PROCESSING_FAILED" if processing_failed else "PENDING_REVIEW"
+                             if counts["PENDING_REVIEW"] else "COMMITTED" if committed else "PREVIEW_READY")
         return {"preview_id": preview_id, "preview_only": preview, "committed": committed,
                 "session_id": preview_id, "processing_results": rows,
                 "source_documents": deepcopy(state["sources"]),
@@ -345,6 +450,7 @@ class DatabaseWorkflow:
                                "reviewed_source_issues": list(state["source_reviews"].values()),
                                "document_issues": state["totals"], "preview_only": preview,
                                "excluded_items": [e.model_dump(mode="json") for e in state["batch"].excluded_items],
+                               "processing_status": processing_status,
                                "using_mock_data": self.use_mock_data, "database_enabled": self.db.db_config.get("database") != ":memory:"}}
 
     @staticmethod

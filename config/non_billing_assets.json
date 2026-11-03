@@ -1,0 +1,9 @@
+{
+  "8fc7c81f49d99256c3e028a7b3f8682aa3f68be055299571e763472bb71bf3f7": {
+    "approved": true,
+    "scope": "email_attachment",
+    "reason": "已查看原图：中美跨境数智工具推广横幅，含二维码及海湾大桥照片，无账单编号、费用明细或金额；仅排除此精确文件摘要的邮件图片。",
+    "reviewed_by": "development_image_review",
+    "reviewed_at": "2026-11-03"
+  }
+}

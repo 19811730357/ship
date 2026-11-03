@@ -9,7 +9,7 @@ import uuid
 
 from .models import Ledger, LedgerRecord
 
-CONFIG_VERSION = "safe-billing-v2.1"
+CONFIG_VERSION = "safe-billing-v2.2"
 
 
 def normalize(value):
